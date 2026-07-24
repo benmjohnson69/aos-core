@@ -60,6 +60,19 @@ memory, handoffs) accumulates per-machine in `~/.aos-private/` and the working r
 mkdir -p ~/.aos-private/identity && $EDITOR ~/.aos-private/identity/anchor.md
 ```
 
+## Acknowledgments
+
+aos-core stands on patterns learned from others — hat tips:
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** (Anthropic) — the hooks, plugins,
+  and skills substrate all of this rides on.
+- **[superpowers](https://github.com/obra/superpowers)** (Jesse Vincent) — the skills-first working
+  discipline, and the plugin/marketplace structure this repo's packaging was learned from.
+- **compound-engineering** (Kieran Klaassen / [Every](https://every.to)) — the compound-learning loop:
+  every solved bug becomes a searchable lesson that resurfaces at edit time. The prior-fix surfacing
+  hook here descends directly from that pattern.
+- **[Ralph](https://ghuntley.com/ralph/)** (Geoffrey Huntley) — the autonomous build-verify-continue
+  loop pattern used to develop much of this plugin.
+
 ## Verify it works
 - Fresh session → the identity anchor appears at turn-0 (clean persona if no private layer).
 - Edit a `.py` with a type error → an `⚠️ E2` note surfaces the same turn.

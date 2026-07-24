@@ -1,0 +1,21 @@
+{
+  "schema": "aos-profile.v1",
+  "profile": "work",
+  "legs": {
+    "mechanisms": {
+      "source": "github.com/benmjohnson69/aos-core",
+      "description": "Content-free plugin — 8 hook-based capabilities (identity, E2, compaction, prior-fix, delegation hygiene, feature-registry, session-close, storm-proof-commit). Install via /plugin install aos-core."
+    },
+    "identity": {
+      "path": "~/.aos-private",
+      "required": false,
+      "description": "Work-profile bundle assembled by build_private_bundle.py --profile work. Contains only [SCOPE: work-safe] segments; grep gate enforced before publish. Absent = clean generic persona."
+    },
+    "tooling": {
+      "injector": "~/.claude/hooks/tool-route-injector.py",
+      "routes": "~/.claude/tool_routes.json",
+      "mcp": ["webfetch"],
+      "description": "UserPromptSubmit hook that injects curated tool routes at turn-0; work-profile curated routes (AOS/personal routes stripped); webfetch MCP for token-efficient search."
+    }
+  }
+}
