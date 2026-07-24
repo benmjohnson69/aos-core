@@ -8,7 +8,7 @@
     {
       "name": "aos-core",
       "description": "Turn-0 identity, compaction survival, and write-time coding hygiene for Claude Code. Ships zero personal data; loads ~/.aos-private/ only if present.",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": ".",
       "author": {
         "name": "Ben Johnson"
