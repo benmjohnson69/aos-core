@@ -129,3 +129,11 @@ Steps: (a) `build_private_bundle.py --profile work` — grep gate runs inside; a
 
 Fail-closed: `set -euo pipefail`; any step failure aborts. Idempotent: safe to run repeatedly;
 version auto-increments each run. An unverified byte cannot reach the drive.
+
+## Roadmap — session organization (v0.3 direction)
+The next layer up from single-session mechanisms: **sessions → projects → campaigns.**
+- **Sessions** are already first-class (handoffs, compaction survival). 
+- **Projects** group sessions around one deliverable (shared handoff dir, shared solutions).
+- **Campaigns** coordinate multiple projects toward one outcome (the pattern proven in the
+  parent system with tmux-organized, topic-scoped persistent sessions).
+Goal: make "where was I?" answerable at every altitude, not just inside one session.
