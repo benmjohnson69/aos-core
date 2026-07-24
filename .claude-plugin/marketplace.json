@@ -1,14 +1,18 @@
 {
   "name": "aos-core-marketplace",
-  "description": "AOS Core — persistent-teammate substrate (identity + compaction survival + coding hygiene), content-free by construction.",
-  "owner": { "name": "Ben Johnson" },
+  "description": "AOS Core \u2014 persistent-teammate substrate (identity + compaction survival + coding hygiene), content-free by construction.",
+  "owner": {
+    "name": "Ben Johnson"
+  },
   "plugins": [
     {
       "name": "aos-core",
       "description": "Turn-0 identity, compaction survival, and write-time coding hygiene for Claude Code. Ships zero personal data; loads ~/.aos-private/ only if present.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "source": ".",
-      "author": { "name": "Ben Johnson" }
+      "author": {
+        "name": "Ben Johnson"
+      }
     }
   ]
 }

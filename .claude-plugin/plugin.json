@@ -1,9 +1,18 @@
 {
   "name": "aos-core",
-  "version": "0.1.0",
-  "description": "Persistent-teammate substrate for Claude Code: turn-0 identity, compaction survival, and write-time coding hygiene. Content-free by construction — all personal data lives in a separate ~/.aos-private/ layer it loads only if present.",
-  "author": { "name": "Ben Johnson" },
+  "version": "0.2.0",
+  "description": "Persistent-teammate substrate for Claude Code: turn-0 identity, compaction survival, write-time coding hygiene, and a keyword control language (rvr, adversarial-review, IHSD persona fan-out, and more). Content-free by construction \u2014 all personal data lives in a separate ~/.aos-private/ layer it loads only if present.",
+  "author": {
+    "name": "Ben Johnson"
+  },
   "license": "MIT",
-  "keywords": ["memory", "identity", "compaction", "session-continuity", "coding-hygiene", "e2"],
+  "keywords": [
+    "memory",
+    "identity",
+    "compaction",
+    "session-continuity",
+    "coding-hygiene",
+    "e2"
+  ],
   "hooks": "./hooks/hooks.json"
 }
