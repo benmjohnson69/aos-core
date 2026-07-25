@@ -1,6 +1,6 @@
 {
   "name": "aos-core",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Persistent-teammate substrate for Claude Code: turn-0 identity, compaction survival, write-time coding hygiene, and a keyword control language (rvr, adversarial-review, IHSD persona fan-out, and more). Content-free by construction \u2014 all personal data lives in a separate ~/.aos-private/ layer it loads only if present.",
   "author": {
     "name": "Ben Johnson"

@@ -40,6 +40,7 @@ contains none.
 | Search-before-you-build — repo capability registry surfaced at turn-0 | `tools/build_feature_registry.py` → `hooks/sessionstart-feature-registry.py` | yes (indexes `<repo>/tools` + `skills`; summary at `<cwd>/data/feature_registry_summary.md`) |
 | Session continuity — resumable handoff at session close | `skills/session-close/` + advisory `hooks/stop-session-close.py` | yes (handoffs to `<cwd>/docs/session-handoffs/`) |
 | Storm-proof commit — CAS plumbing commit that never touches `.git/index.lock` | `tools/git_plumbing_commit.py` | yes (generic git; zero config) |
+| Shared-state blackboard — lock-safe per-mission KV for multi-session/agent coordination | `lib/blackboard.py` (v0.3) | yes (store at `AOS_CORE_BLACKBOARD_DIR` else `<project>/.blackboard/`; E2E-proven partition semantics) |
 
 ### Behavior skills (v0.2) — a keyword control language
 | Skill | Trigger phrases | What it does |
