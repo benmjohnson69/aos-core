@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -326,6 +327,67 @@ def _check_webfetch_mcp() -> Check:
 
 
 # ---------------------------------------------------------------------------
+# Check 7 — annotation compat (PEP 604 unions vs the target Python)
+# ---------------------------------------------------------------------------
+def _uses_pep604_union(tree: ast.AST) -> bool:
+    """True if any annotation uses the `X | Y` union operator (PEP 604, 3.10+)."""
+    for node in ast.walk(tree):
+        ann = None
+        if isinstance(node, ast.AnnAssign):
+            ann = node.annotation
+        elif isinstance(node, ast.arg):
+            ann = node.annotation
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            ann = node.returns
+        if ann is None:
+            continue
+        for sub in ast.walk(ann):
+            if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.BitOr):
+                return True
+    return False
+
+
+def check_import_compat() -> list[Check]:
+    """Static guard for the F1 bug class: PEP 604 unions (`dict | None`) crash at
+    import time on Python < 3.10 UNLESS the file carries `from __future__ import
+    annotations`. py_compile does NOT catch this — annotations are only evaluated at
+    module-exec time. This runs under the *target* interpreter, so it flags exactly
+    the files that would crash on THIS machine, and passes cleanly on 3.10+."""
+    key, label = "import_compat", "annotation compat (PEP 604 vs this Python)"
+    if sys.version_info >= (3, 10):
+        return [ok(key, label, f"Python {sys.version_info.major}.{sys.version_info.minor} — PEP 604 unions native, no risk")]
+
+    offenders: list[str] = []
+    scanned = 0
+    for py in PLUGIN_ROOT.rglob("*.py"):
+        try:
+            src = py.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        scanned += 1
+        if "from __future__ import annotations" in src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue  # a genuine syntax error belongs to a different check
+        if _uses_pep604_union(tree):
+            offenders.append(str(py.relative_to(PLUGIN_ROOT)))
+
+    if offenders:
+        sample = ", ".join(sorted(offenders)[:5])
+        more = f" (+{len(offenders) - 5} more)" if len(offenders) > 5 else ""
+        return [fail(
+            key,
+            label,
+            f"{len(offenders)} file(s) crash on import under Python "
+            f"{sys.version_info.major}.{sys.version_info.minor}: {sample}{more} "
+            "— add `from __future__ import annotations`",
+        )]
+    return [ok(key, label, f"clean — {scanned} .py file(s) scanned, no unguarded PEP 604 unions")]
+
+
+# ---------------------------------------------------------------------------
 # Report rendering
 # ---------------------------------------------------------------------------
 _STATUS_WIDTH = 4  # PASS/FAIL/SKIP
@@ -359,6 +421,7 @@ def run_all_checks() -> list[Check]:
     checks.extend(check_identity_bundle())  # 4
     checks.append(check_bundle_version())  # 5
     checks.extend(check_tooling_leg())  # 6
+    checks.extend(check_import_compat())  # 7
     return checks
 
 

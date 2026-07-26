@@ -22,6 +22,8 @@ Implementation validated by:
 - agent-blackboard (Python with domain-partitioned persistence)
 """
 
+from __future__ import annotations  # PEP 604 unions (dict | None) need this on Python 3.9
+
 import fcntl
 import json
 import uuid
