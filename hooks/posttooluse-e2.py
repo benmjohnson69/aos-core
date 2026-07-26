@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +18,23 @@ from pathlib import Path
 PY = os.environ.get("AOS_CORE_PY", sys.executable or "python3")
 SKIP = ("/.venv/", "/node_modules/", "/dist/", "/__pycache__/", "/tmp/", "/site-packages/")
 TIMEOUT = 8
+
+# bootstrap.sh installs ruff/mypy into an isolated venv that is NOT on PATH. A bare
+# `ruff`/`mypy` lookup would then fail and _run() would treat the tool as absent —
+# so E2 silently no-ops. Resolve from that venv as a fallback so "installed" always
+# means "findable", regardless of PATH. Override the dir with AOS_CORE_E2_BIN.
+E2_VENV_BIN = Path(os.environ.get("AOS_CORE_E2_BIN", str(Path.home() / ".venvs" / "e2" / "bin")))
+
+
+def _resolve(tool: str) -> str | None:
+    """tool path from PATH, else the E2 venv; None only when genuinely absent everywhere."""
+    on_path = shutil.which(tool)
+    if on_path:
+        return on_path
+    cand = E2_VENV_BIN / tool
+    if cand.is_file() and os.access(cand, os.X_OK):
+        return str(cand)
+    return None
 
 
 def _read_payload() -> dict:
@@ -51,12 +69,15 @@ def main() -> int:
         fp = _target(_read_payload())
         if not fp:
             return 0
+        ruff, mypy = _resolve("ruff"), _resolve("mypy")
+        checks: list[tuple[str, list[str]]] = []
+        if ruff:
+            checks.append(("ruff", [ruff, "check", fp]))
+        if mypy:
+            checks.append(("mypy", [mypy, "--ignore-missing-imports", fp]))
+        checks.append(("py_compile", [PY, "-m", "py_compile", fp]))  # PY always available
         fails = []
-        for name, cmd in (
-            ("ruff", ["ruff", "check", fp]),
-            ("mypy", ["mypy", "--ignore-missing-imports", fp]),
-            ("py_compile", [PY, "-m", "py_compile", fp]),
-        ):
+        for name, cmd in checks:
             ok, tail = _run(cmd)
             if not ok:
                 fails.append(f"{name}: {tail.strip()[:200]}")

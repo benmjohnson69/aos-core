@@ -151,6 +151,80 @@ rsync -a --delete \
 echo "      Mirror updated." >&2
 
 # ---------------------------------------------------------------------------
+# (f) OPTIONAL — publish the plugin tree to the PUBLIC aos-core repo
+#     Closes the staging->public drift gap: (a)-(e) publish to the NAS only, so
+#     the public repo that bootstrap.sh git-clones could silently fall behind the
+#     mirror. Gated behind AOS_CORE_PUBLISH=1 — a public push is NEVER a silent
+#     side effect of a NAS release. Fail-closed: refuses to push without a
+#     banned-token gate; a publish failure never fails the (done) NAS release.
+# ---------------------------------------------------------------------------
+if [[ "${AOS_CORE_PUBLISH:-0}" == "1" ]]; then
+    PUBLIC_REPO="${AOS_CORE_PUBLIC_REPO:-git@github.com:benmjohnson69/aos-core.git}"
+    echo "[publish] Publishing plugin tree to public repo: ${PUBLIC_REPO}" >&2
+    set +e
+    (
+        set -e
+        PUB_TMP="$(mktemp -d)"
+        trap 'rm -rf "${PUB_TMP}"' EXIT
+        git clone --depth 1 "${PUBLIC_REPO}" "${PUB_TMP}/repo" >/dev/null 2>&1
+        # sync the plugin tree over the clone; preserve the repo's own .git
+        rsync -a --delete \
+            --exclude='.git' --exclude='__pycache__' --exclude='.mypy_cache' --exclude='*.pyc' \
+            "${PLUGIN_ROOT}/" "${PUB_TMP}/repo/"
+        # fail-closed banned-token gate BEFORE any public push (canonical manifest list)
+        "${PYTHON}" - "${PUB_TMP}/repo" "${PERSONAL_SOURCE}/bundle.manifest.json" <<'PYG'
+import json, re, sys
+from pathlib import Path
+root, manifest_path = Path(sys.argv[1]), Path(sys.argv[2])
+if not manifest_path.is_file():
+    print("  [publish] ABORT: no bundle.manifest.json — refusing to push to PUBLIC without a gate", file=sys.stderr)
+    sys.exit(3)
+banned = [t for t in json.loads(manifest_path.read_text()).get("banned_tokens", []) if t.strip()]
+if not banned:
+    print("  [publish] ABORT: banned-token list empty — refusing to push to PUBLIC without a gate", file=sys.stderr)
+    sys.exit(3)
+B64 = re.compile(r'data:[^"\')\s]+|[A-Za-z0-9+/]{40,}={0,2}')  # strip embedded images before matching
+SKIP_SUFFIX = {".tgz", ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".pyc", ".woff", ".woff2", ".ttf"}
+hits = 0
+for p in root.rglob("*"):
+    if not p.is_file() or "/.git/" in str(p) or p.name == "banned_tokens.txt":
+        continue
+    if p.suffix.lower() in SKIP_SUFFIX:
+        continue
+    try:
+        clean = B64.sub("", p.read_text(errors="ignore"))
+    except (OSError, ValueError):
+        continue
+    for tok in banned:
+        if re.search(re.escape(tok), clean, re.I):
+            print(f"  [publish] LEAK '{tok}' in {p.relative_to(root)}", file=sys.stderr)
+            hits += 1
+if hits:
+    print(f"  [publish] ABORT: {hits} banned-token hit(s) — NOT pushing to public.", file=sys.stderr)
+    sys.exit(2)
+print(f"  [publish] gate: 0 banned-token hits ({len(banned)} tokens) — safe to push ✓", file=sys.stderr)
+PYG
+        cd "${PUB_TMP}/repo"
+        if [[ -z "$(git status --porcelain)" ]]; then
+            echo "  [publish] public repo already current — no drift, nothing to push" >&2
+        else
+            git add -A
+            git -c user.name="aos-core release" -c user.email="noreply@anthropic.com" \
+                commit -q -m "chore(release): sync plugin tree from staging (bundle v${NEXT_VERSION})"
+            git push origin HEAD >/dev/null 2>&1
+            echo "  [publish] pushed plugin tree to public ($(git rev-parse --short HEAD))" >&2
+        fi
+    )
+    PUB_RC=$?
+    set -e
+    if [[ "${PUB_RC}" -ne 0 ]]; then
+        echo "  [publish] WARNING: publish failed (rc=${PUB_RC}); NAS release stands. Fix + re-run with AOS_CORE_PUBLISH=1." >&2
+    fi
+else
+    echo "[publish] skipped (set AOS_CORE_PUBLISH=1 to also push the plugin tree to the public aos-core repo)" >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 echo "" >&2
@@ -158,4 +232,5 @@ echo "=== Release complete ===" >&2
 echo "  tarball : ${DRIVE_DIR}/${TARBALL_NAME}" >&2
 echo "  mirror  : ${MIRROR_DEST}" >&2
 echo "  version : v${NEXT_VERSION}" >&2
+echo "  publish : ${AOS_CORE_PUBLISH:-0} (1 = pushed plugin tree to public aos-core)" >&2
 echo "" >&2
