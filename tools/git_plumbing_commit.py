@@ -39,6 +39,34 @@ from typing import Iterable
 _AOS_HOME = Path(__file__).resolve().parent.parent
 
 
+def _repo_root() -> Path:
+    """The repo this commit belongs to — the CALLER's, not the plugin's.
+
+    F11: this module anchored everything to its own install location, so once
+    aos-core lives at ~/aos-core (the normal install), every commit and every
+    index.lock path pointed at the plugin repo instead of the project the user
+    is actually working in. Resolution order:
+      1. CLAUDE_PROJECT_DIR  — the harness's own notion of the project root
+      2. git rev-parse --show-toplevel from cwd — works in worktrees + submodules
+      3. _AOS_HOME — last-resort fallback (preserves prior behavior)
+    """
+    env_root = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env_root:
+        p = Path(env_root).expanduser()
+        if (p / ".git").exists():
+            return p
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(Path.cwd()), capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return Path(r.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return _AOS_HOME
+
+
 def _clear_stale_index_lock(max_age_s: float = 120.0) -> bool:
     """Remove .git/index.lock ONLY if provably stale — it exists AND its mtime
     is older than max_age_s. A live git op holds the lock for far less than
@@ -49,7 +77,7 @@ def _clear_stale_index_lock(max_age_s: float = 120.0) -> bool:
     Returns True if a stale lock was cleared.
     """
     try:
-        lock = _AOS_HOME / ".git" / "index.lock"
+        lock = _repo_root() / ".git" / "index.lock"
         if lock.exists() and (time.time() - lock.stat().st_mtime) > max_age_s:
             lock.unlink()
             return True
@@ -119,7 +147,7 @@ def _reset_uncommitted_counter(new_sha: str, reset_by: str = "git_plumbing_commi
 
 def _run(args: list[str], env: dict[str, str] | None = None) -> tuple[int, str, str]:
     p = subprocess.run(
-        args, cwd=str(_AOS_HOME), env=env, capture_output=True, text=True
+        args, cwd=str(_repo_root()), env=env, capture_output=True, text=True
     )
     return p.returncode, p.stdout.strip(), p.stderr.strip()
 
@@ -165,7 +193,14 @@ def plumbing_commit(
     for attempt in range(1, max_retries + 1):
         rc, parent, err = _run(["git", "rev-parse", "HEAD"])
         if rc != 0:
-            return False, f"rev_parse_head_failed: {err}"
+            # F11: a fresh `git init` has an UNBORN HEAD — no commit exists yet, so
+            # rev-parse legitimately fails. That is not an error, it's the initial
+            # commit. Distinguish it from a broken repo by confirming we're inside
+            # a git dir at all; only then proceed parentless.
+            grc, _, _ = _run(["git", "rev-parse", "--git-dir"])
+            if grc != 0:
+                return False, f"rev_parse_head_failed: {err}"
+            parent = ""  # unborn HEAD → this becomes the root commit
 
         with tempfile.NamedTemporaryFile(
             prefix="plumb_idx_", suffix=".idx", delete=False
@@ -175,9 +210,19 @@ def plumbing_commit(
             env = dict(os.environ)
             env["GIT_INDEX_FILE"] = tmp_index
 
-            rc, _, err = _run(["git", "read-tree", parent], env=env)
-            if rc != 0:
-                return False, f"read_tree_failed: {err}"
+            if parent:  # nothing to seed the index from on a root commit
+                rc, _, err = _run(["git", "read-tree", parent], env=env)
+                if rc != 0:
+                    return False, f"read_tree_failed: {err}"
+            else:
+                # NamedTemporaryFile leaves a 0-byte file, and git rejects an empty
+                # index ("index file smaller than expected"). With a parent, read-tree
+                # initializes it; on a root commit nothing does — so remove it and let
+                # git create a fresh index at that path.
+                try:
+                    os.unlink(tmp_index)
+                except OSError:
+                    pass
 
             rc, _, err = _run(["git", "add", "--", *paths], env=env)
             if rc != 0:
@@ -187,9 +232,11 @@ def plumbing_commit(
             if rc != 0 or not tree:
                 return False, f"write_tree_failed: {err}"
 
-            rc, new_sha, err = _run(
-                ["git", "commit-tree", tree, "-p", parent, "-m", message], env=env
-            )
+            commit_args = ["git", "commit-tree", tree]
+            if parent:
+                commit_args += ["-p", parent]  # omitted → root commit
+            commit_args += ["-m", message]
+            rc, new_sha, err = _run(commit_args, env=env)
             if rc != 0 or not new_sha:
                 return False, f"commit_tree_failed: {err}"
 

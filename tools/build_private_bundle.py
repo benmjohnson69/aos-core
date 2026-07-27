@@ -35,11 +35,45 @@ import sys
 from pathlib import Path
 
 # Scope model: unmarked content is personal-only (fail-safe). Each profile lists the scopes it admits.
+#
+# `folio-safe` (2026-07-26) — counterpart profiles: Ben's own working assessments of
+# colleagues. These are the highest-value unshipped asset ("knows the people I work
+# with"), and there is no ownership question — he wrote them. The risk is not the
+# CONCLUSION, it is the PROVENANCE: "tends to re-litigate in writing, get it in email"
+# is a working note; "on the 3/14 call he said «...»" is a recording derivative, and it
+# reads very differently if the file is ever read by someone other than Ben on
+# company-issued hardware. So folio-safe content ships, but goes through
+# strip_provenance() first — conclusions travel, sourcing does not.
 PROFILE_SCOPES: dict[str, set[str]] = {
-    "work": {"work-safe"},
-    "personal": {"work-safe", "personal-only"},
+    "work": {"work-safe", "folio-safe"},
+    "personal": {"work-safe", "folio-safe", "personal-only"},
 }
 DEFAULT_SCOPE = "personal-only"
+
+# Lines that attribute a claim to a recording/meeting/private channel. The claim may
+# travel; the sourcing may not. Applied ONLY to folio-safe segments.
+PROVENANCE_RE = re.compile(
+    r"(on the .{0,30}\bcall\b|in the .{0,30}\b(meeting|1:1|one-on-one)\b"
+    r"|per the (transcript|recording|tape)|\btranscript\b|\brecording\b"
+    r"|\bplaud\b|said (that )?[\"“«]|\bquote[ds]?\b[:,]|\[\d{2}:\d{2}(:\d{2})?\])",
+    re.IGNORECASE,
+)
+
+
+def strip_provenance(text: str) -> tuple[str, int]:
+    """Drop lines that source a claim to a recording/meeting. Returns (text, n_dropped).
+
+    Deliberately line-granular and conservative: a folio line that cites how Ben knows
+    something is removed whole rather than partially redacted, because a half-scrubbed
+    quote still reproduces the sensitive part.
+    """
+    kept, dropped = [], 0
+    for line in text.splitlines():
+        if PROVENANCE_RE.search(line):
+            dropped += 1
+            continue
+        kept.append(line)
+    return "\n".join(kept), dropped
 SCOPE_RE = re.compile(r"\[SCOPE:\s*([a-z-]+)\s*\]", re.IGNORECASE)
 HEADER_RE = re.compile(r"^#{1,6}\s")
 UPDATED_RE = re.compile(r"\[Updated\s+(\d{4}-\d{2}-\d{2})")

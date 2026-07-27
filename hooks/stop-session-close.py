@@ -49,7 +49,13 @@ def main() -> int:
     if payload.get("stop_hook_active"):
         return 0
     try:
-        if _has_fresh_handoff(handoffs_dir()):
+        d = handoffs_dir()
+        # No handoffs dir = this repo doesn't use the convention. Absence of the
+        # convention is not a stale handoff — nagging here fires in every unrelated
+        # project. Only advise where the convention actually exists.
+        if not d.is_dir():
+            return 0
+        if _has_fresh_handoff(d):
             return 0
         msg = ("aos-core: no fresh session handoff found. Before stopping, consider running the "
                "session-close skill to write a resumable handoff to docs/session-handoffs/ so the "
