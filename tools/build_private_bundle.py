@@ -148,6 +148,60 @@ def build_memory(memory_source: Path | None, profile: str) -> tuple[str, dict[st
     return "\n".join(index_lines) + "\n", kept
 
 
+# CATEGORY DETECTORS — the denylist's structural blind spot.
+#
+# An enumerated denylist reports 0 hits for everything it was never told about, and
+# "0 hits" reads as "verified safe" rather than "verified against 15 strings". v8
+# shipped Ben's DOB, personal email, mobile, a full medication schedule and a genotype
+# with a clean 0-hit sweep, because none of those words were on the list — and they
+# never would have been. Prior sweeps only caught health terms because someone had
+# happened to enumerate those specific drug names.
+#
+# These match on SHAPE, not on membership, so they catch the un-enumerated case.
+# Note: the genotype pattern is deliberately case-SENSITIVE — [ACGT] under re.I
+# matches ordinary lowercase words ("CSO at" → "at"), which is a false-positive mill.
+CATEGORY_DETECTORS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("personal-email", re.compile(r"[\w.+-]+@(?:gmail|icloud|me|yahoo|outlook|hotmail|proton)\.\w+", re.I)),
+    ("phone-number", re.compile(r"\(?\b\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b")),
+    ("date-of-birth", re.compile(r"\bDOB\b|\bdate of birth\b|\bborn (?:in |on )?(?:19|20)\d\d", re.I)),
+    # Deliberately GENERIC. An earlier version enumerated the principal's actual
+    # prescriptions — which meant this very file, once published, contained the drug
+    # names it exists to keep out, and the gate correctly blocked its own detector.
+    # Specific names belong in the private manifest; the shipped detector matches on
+    # pharmaceutical SHAPE (common stems/suffixes) plus dose adjacency, so it needs no
+    # knowledge of any individual's regimen.
+    ("medication", re.compile(
+        # NOTE: `-opril`, not `-pril` — the looser form matches "April" and blocked a
+        # bundle on an employment-history line. Drug-name stems must be long enough to
+        # be pharmaceutical: every real ACE inhibitor is -opril (lisin-, enal-, rami-).
+        r"\b\w{2,}(?:cillin|mycin|cycline|statin|prazole|sartan|olol|opril|azepam|"
+        r"tidine|dronate|glutide|afinil|thyroxine)\b"
+        r"|\b(?:hormone|testosterone|estrogen|insulin)\s+(?:injection|therapy|replacement)\w*"
+        r"|\b(?:mg|mcg)\s+(?:daily|twice|nightly|fasted|AM|PM)\b", re.I)),
+    ("dosage-schedule", re.compile(r"\b\d+\s?(?:mg|mcg|ml|iu)\b", re.I)),
+    ("genotype", re.compile(r"\b[A-Z]{2,5}\d?\s+[ACGT]{2}\b|\bgenotype\b|\brs\d{4,}\b")),
+    ("home-address", re.compile(r"\b\d{1,5}\s+\w+\s+(?:Drive|Dr|Street|St|Road|Rd|Lane|Ln|Ave|Avenue|Court|Ct)\b", re.I)),
+]
+
+
+def category_scan(out_dir: Path) -> list[str]:
+    """Shape-based scan for PII/PHI the denylist can't enumerate. Returns 'file: category — line'."""
+    hits: list[str] = []
+    for path in sorted(out_dir.rglob("*")):
+        if not path.is_file() or path.name == "banned_tokens.txt":
+            continue
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        lines = text.splitlines()
+        for label, rx in CATEGORY_DETECTORS:
+            for m in rx.finditer(text):
+                ln = text[: m.start()].count("\n")
+                hits.append(f"{path.name}:{ln + 1}: {label} — {lines[ln].strip()[:70]}")
+    return hits
+
+
 def grep_gate(out_dir: Path, banned: list[str]) -> list[str]:
     """Scan every file in the built bundle for banned tokens. Returns list of 'file: token' hits."""
     hits: list[str] = []
@@ -225,7 +279,25 @@ def main() -> int:
             for h in hits[:20]:
                 print(f"  {h}", file=sys.stderr)  # c1-ok
             return 2
-        print(f"grep gate: 0 banned-token hits across {sum(1 for _ in out.rglob('*') if _.is_file())} files ✓")  # c1-ok
+        # CATEGORY GATE — fail-closed, same as the denylist. This is the layer that
+        # would have stopped v8 shipping a DOB, a personal mobile, a medication
+        # schedule and a genotype under a clean 0-hit denylist sweep.
+        cat_hits = category_scan(out)
+        if cat_hits:
+            shutil.rmtree(out)
+            print("CATEGORY GATE FAILED — PII/PHI shape detected; bundle DELETED:", file=sys.stderr)  # c1-ok
+            for h in cat_hits[:20]:
+                print(f"  {h}", file=sys.stderr)  # c1-ok
+            print("  (mark these lines [SCOPE: personal-only] — they are shape-detected,", file=sys.stderr)  # c1-ok
+            print("   so adding them to banned_tokens will NOT help.)", file=sys.stderr)  # c1-ok
+            return 2
+        # Report the COVERAGE, not just the count: "0 hits" reads as "verified safe"
+        # when it only ever meant "verified against N strings". Naming both the token
+        # count and the category count makes the boundary of the check visible.
+        n_files = sum(1 for _ in out.rglob("*") if _.is_file())
+        print(f"gate: 0 hits — {len(banned)} denylist tokens + "  # c1-ok
+              f"{len(CATEGORY_DETECTORS)} PII/PHI category detectors "
+              f"across {n_files} files ✓")
 
     files = sorted(str(p.relative_to(out)) for p in out.rglob("*") if p.is_file())
     print(f"built {args.profile} bundle → {out}  ({len(files)} files)")  # c1-ok
