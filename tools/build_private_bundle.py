@@ -60,6 +60,45 @@ PROVENANCE_RE = re.compile(
 )
 
 
+# FOLIO NORMALIZATION — Ben's ruling, work-Mac's rule, encoded.
+#
+#   "Would Ben be comfortable if this line were read aloud by the person it
+#    describes? If no, REWORD to carry the same operating meaning — don't delete
+#    the insight."
+#
+# Deletion loses the value; rewording keeps it and survives disclosure. Two halves,
+# and only one can be automated honestly:
+#   FIGURES  — mechanical. Third-party compensation on an employer-owned machine is
+#              the sharpest edge here and it is pure pattern. Replaced, not deleted,
+#              so "retention package in place" still tells you how to act.
+#   PHRASING — judgment. A gate NAMES the line and fails closed rather than pretending
+#              a regex can reword "political-risk relationship" into something that
+#              keeps the meaning. Automating that would quietly destroy the insight.
+_MONEY_RE = re.compile(r"[~≈]?\$\s?\d[\d,.]*\s?(?:[KMB]\b|million|billion)?", re.I)
+_COMP_CONTEXT_RE = re.compile(r"retention|earnout|salary|comp\b|package|bonus|equity|car\b", re.I)
+# Language that reads as a verdict on a person rather than a note on how to work with them.
+SHARP_LANGUAGE = [
+    "political-risk", "blind spot", "resistance point", "resistant", "overloaded",
+    "under-resourced", "ally under strain", "weak", "liability", "problem child",
+    "empire", "threatened", "insecure", "incompetent",
+]
+
+
+def folio_normalize(text: str) -> tuple[str, list[str]]:
+    """Strip third-party figures; return (text, sharp_lines_needing_manual_reword)."""
+    out, sharp = [], []
+    for i, line in enumerate(text.splitlines(), 1):
+        if _COMP_CONTEXT_RE.search(line) and _MONEY_RE.search(line):
+            line = _MONEY_RE.sub("[figure withheld]", line)
+        low = line.lower()
+        for term in SHARP_LANGUAGE:
+            if term in low:
+                sharp.append(f"L{i}: '{term}' — {line.strip()[:66]}")
+                break
+        out.append(line)
+    return "\n".join(out), sharp
+
+
 def strip_provenance(text: str) -> tuple[str, int]:
     """Drop lines that source a claim to a recording/meeting. Returns (text, n_dropped).
 
@@ -251,12 +290,27 @@ def main() -> int:
 
     # Per-file scope-filtered copies — the fuller work-safe corpus for on-demand reading. Only
     # files with at least one admitted segment are emitted; unmarked content never lands here.
+    sharp_findings: list[str] = []
     for src in sorted(source.glob("*.md")):
         if src.name in ("FRESH_STATE.md",):
             continue
-        admitted = segment_scopes(src.read_text(errors="ignore"), scopes)
-        if admitted.strip():
-            (out / "PERSONAL" / src.name).write_text(admitted + "\n")
+        raw = src.read_text(errors="ignore")
+        admitted = segment_scopes(raw, scopes)
+        if not admitted.strip():
+            continue
+        # Folio content carries third-party assessments. For the WORK profile it must
+        # be normalized on the way out — otherwise every bundle bump silently
+        # reintroduces colleagues' compensation onto an employer-owned machine, and it
+        # only gets caught if a human happens to look. Doing it here (build time) rather
+        # than by hand means it cannot regress.
+        if args.profile == "work" and "folio-safe" in raw.lower():
+            admitted, sharp = folio_normalize(admitted)
+            sharp_findings += [f"{src.name} {s}" for s in sharp]
+            # Provenance ("on the 3/14 call he said...") is sourcing, not conclusion.
+            admitted, dropped = strip_provenance(admitted)
+            if dropped:
+                print(f"  folio: {src.name} — dropped {dropped} provenance line(s)", file=sys.stderr)  # c1-ok
+        (out / "PERSONAL" / src.name).write_text(admitted + "\n")
 
     mem_index, mem_files = build_memory(args.memory_source, args.profile)
     if mem_index:
@@ -291,6 +345,20 @@ def main() -> int:
             print("  (mark these lines [SCOPE: personal-only] — they are shape-detected,", file=sys.stderr)  # c1-ok
             print("   so adding them to banned_tokens will NOT help.)", file=sys.stderr)  # c1-ok
             return 2
+        # SHARP-LANGUAGE gate — the half of Ben's rule that CANNOT be automated.
+        # A regex can strip a salary; it cannot reword "political-risk relationship"
+        # into something that keeps the operating meaning. So this names the lines and
+        # fails closed, rather than silently shipping a verdict on a colleague or
+        # silently deleting the insight. Reword in PERSONAL/, then rebuild.
+        if sharp_findings:
+            shutil.rmtree(out)
+            print("FOLIO GATE — sharp language needs rewording; bundle DELETED:", file=sys.stderr)  # c1-ok
+            for s in sharp_findings[:20]:
+                print(f"  {s}", file=sys.stderr)  # c1-ok
+            print("  Rule: would Ben be comfortable if this were read aloud by the person", file=sys.stderr)  # c1-ok
+            print("  it describes? If no, REWORD to keep the operating meaning — don't delete.", file=sys.stderr)  # c1-ok
+            return 2
+
         # Report the COVERAGE, not just the count: "0 hits" reads as "verified safe"
         # when it only ever meant "verified against N strings". Naming both the token
         # count and the category count makes the boundary of the check visible.
