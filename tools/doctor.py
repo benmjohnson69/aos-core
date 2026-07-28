@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """aos-core doctor — answers "is the whole stool green?"
 
-Checks seven concern areas and reports PASS / FAIL / SKIP for each.
+Checks nine concern areas and reports PASS / FAIL / SKIP for each.
 Exit 0 iff no FAILs. --json emits machine-readable JSON.
 
 Usage:
@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -27,6 +28,9 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 
 # Private layer (overridable via env)
 PRIVATE_DIR = Path(os.environ.get("AOS_PRIVATE_DIR", str(Path.home() / ".aos-private")))
+
+# Wall-clock budget for the live-session probe (Check 8) — `claude -p` round trip.
+LIVE_PROBE_TIMEOUT = 90
 
 # ---------------------------------------------------------------------------
 # Result helpers
@@ -388,6 +392,236 @@ def check_import_compat() -> list[Check]:
 
 
 # ---------------------------------------------------------------------------
+# Check 8 — live-session probe (F10)
+# ---------------------------------------------------------------------------
+def check_live_session() -> Check:
+    """THE meta-check. Every other check tests a component in isolation; this one
+    asks the only question that matters: when Claude Code actually starts, do the
+    hooks fire?
+
+    Five real defects — two of them blockers — sat behind a GREEN bar because
+    nothing ever ran the real caller. F8 is the canonical case: a `statusLine`
+    entry missing its `"type"` discriminator silently invalidated the ENTIRE hooks
+    block. Every isolated check still passed: the files existed, the JSON parsed,
+    the hooks executed fine when invoked by hand. Only a live session showed that
+    Claude Code had loaded none of them.
+
+    Spawns `claude -p` and asserts the SessionStart hook actually fired in the
+    debug log. Skips (never fails) when the CLI is absent or the probe cannot run,
+    so this is safe in CI and on a partial install.
+
+    Set AOS_CORE_DOCTOR_NO_LIVE=1 to skip — also set automatically in the child's
+    environment so a doctor invoked from inside a hook can never recurse.
+    """
+    key, label = "live_session", "live session — hooks actually load"
+
+    if os.environ.get("AOS_CORE_DOCTOR_NO_LIVE"):
+        return skip(key, label, "AOS_CORE_DOCTOR_NO_LIVE set — live probe disabled")
+    if not shutil.which("claude"):
+        return skip(key, label, "claude CLI not on PATH — cannot probe a live session")
+
+    # A SessionStart hook must be registered, or the probe proves nothing.
+    try:
+        settings = json.loads((Path.home() / ".claude" / "settings.json").read_text())
+    except (OSError, ValueError):
+        return skip(key, label, "~/.claude/settings.json unreadable — nothing to probe")
+    registered = [
+        h.get("command", "")
+        for group in settings.get("hooks", {}).get("SessionStart", [])
+        for h in group.get("hooks", [])
+    ]
+    if not registered:
+        return skip(key, label, "no SessionStart hook registered — nothing to probe")
+
+    env = dict(os.environ)
+    env["AOS_CORE_DOCTOR_NO_LIVE"] = "1"  # child must never re-enter this check
+
+    with tempfile.TemporaryDirectory() as td:
+        log = Path(td) / "probe.log"
+        try:
+            subprocess.run(
+                ["claude", "-p", "say OK", "--no-session-persistence",
+                 "--debug", "hooks", "--debug-file", str(log)],
+                capture_output=True, text=True, timeout=LIVE_PROBE_TIMEOUT, check=False,
+                cwd=td, env=env, stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            return skip(key, label, f"probe exceeded {LIVE_PROBE_TIMEOUT}s — network or auth, not a hook defect")
+        except OSError as exc:
+            return skip(key, label, f"probe could not run ({type(exc).__name__}) — not a hook defect")
+
+        try:
+            text = log.read_text(errors="ignore")
+        except OSError:
+            return skip(key, label, "debug log unreadable — probe inconclusive")
+
+    # The exact line Claude Code emits when a SessionStart hook returns successfully.
+    if "Hook SessionStart:startup (SessionStart) success" in text:
+        return ok(key, label, f"SessionStart fired in a real session ({len(registered)} hook(s) registered)")
+
+    # Registered but did not fire. This is the F8 signature — and the whole reason
+    # this check exists. Name the most likely cause rather than just reporting dead.
+    hint = ""
+    sl = settings.get("statusLine")
+    if isinstance(sl, dict) and sl.get("type") != "command":
+        hint = ' — statusLine is missing \'"type": "command"\', which silently voids the entire hooks block (F8)'
+    elif not isinstance(sl, (dict, type(None))):
+        hint = " — statusLine is not an object; an invalid value voids the entire hooks block (F8)"
+    return fail(key, label,
+               f"{len(registered)} SessionStart hook(s) registered but NONE fired in a live session{hint}")
+
+
+# ---------------------------------------------------------------------------
+# Check 8b — per-hook invocability (F10, complements the live-session probe)
+# ---------------------------------------------------------------------------
+_HOOK_SCRIPT_RE = re.compile(r"([^\s\"']+\.(?:py|sh))")
+
+
+def _iter_registered_hooks(settings: dict) -> list[tuple[str, str]]:
+    """Yield (event_name, command_string) for every hook entry across all events."""
+    out: list[tuple[str, str]] = []
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return out
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for h in group.get("hooks", []):
+                if isinstance(h, dict) and "command" in h:
+                    out.append((str(event), str(h["command"])))
+    return out
+
+
+def _extract_hook_script_path(command: str) -> str | None:
+    """Best-effort extraction of the script path from a hook command string
+    (e.g. 'python3 /path/hook.py' or '$CLAUDE_PROJECT_DIR/hooks/hook.py --flag')."""
+    expanded = os.path.expandvars(command)
+    m = _HOOK_SCRIPT_RE.search(expanded)
+    return m.group(1) if m else None
+
+
+def check_hooks_invocable(settings_path: Path | None = None) -> Check:
+    """check_live_session proves the harness fires SOME SessionStart hook end to
+    end; it does not say WHICH hook is broken when it doesn't, and it only exercises
+    one event. This check complements it: walk every wired hook command across every
+    event, and for each one that resolves to a script file, confirm the file exists
+    and runs cleanly on a benign payload. A wiring entry pointing at a missing or
+    renamed script, or a hook that crashes on minimal input, turns this RED with the
+    specific hook named — the F10 gap 'config file exists != hook actually fires',
+    one hook at a time rather than only in aggregate.
+
+    Accepts settings_path for testability (defaults to the real ~/.claude/settings.json).
+    """
+    key, label = "hooks_invocable", "hooks invocable (per-hook liveness)"
+    path = settings_path or (Path.home() / ".claude" / "settings.json")
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return skip(key, label, f"{path} unreadable — nothing to probe ({exc})")
+    except ValueError as exc:
+        return fail(key, label, f"{path} is not valid JSON — the entire hooks block is void ({exc})")
+
+    registered = _iter_registered_hooks(settings)
+    if not registered:
+        return skip(key, label, "no hooks registered in settings.json — nothing to probe")
+
+    dead: list[str] = []
+    checked = 0
+    for event, command in registered:
+        script = _extract_hook_script_path(command)
+        if script is None:
+            continue  # not a recognizable script invocation (e.g. inline shell) — not this check's job
+        script_path = Path(script).expanduser()
+        checked += 1
+        if not script_path.is_file():
+            dead.append(f"{event}:{script_path.name} (missing: {script_path})")
+            continue
+        try:
+            cmd = [sys.executable, str(script_path)] if script_path.suffix == ".py" else ["sh", str(script_path)]
+            result = subprocess.run(
+                cmd, input="{}", capture_output=True, text=True, timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            dead.append(f"{event}:{script_path.name} (timed out after 10s)")
+            continue
+        except OSError as exc:
+            dead.append(f"{event}:{script_path.name} (could not invoke: {exc})")
+            continue
+        if result.returncode != 0:
+            stderr_preview = result.stderr[:100].replace("\n", " ")
+            dead.append(f"{event}:{script_path.name} (exit {result.returncode}: {stderr_preview})")
+
+    if checked == 0:
+        return skip(key, label, "no file-based hook commands found to probe")
+    if dead:
+        sample = "; ".join(dead[:3])
+        more = f" (+{len(dead) - 3} more)" if len(dead) > 3 else ""
+        return fail(key, label, f"{len(dead)}/{checked} hook(s) dead: {sample}{more}")
+    return ok(key, label, f"{checked} hook(s) invoked cleanly (exit 0) across {len(registered)} registration(s)")
+
+
+# ---------------------------------------------------------------------------
+# Check 9 — situational corpus (work-order item 16)
+# ---------------------------------------------------------------------------
+def check_situational_corpus() -> list[Check]:
+    """The same blind spot as Check 8, one plane up: a consumer can be correctly
+    wired, firing on every edit, and matching nothing — forever — because its
+    corpus is empty. Mechanism-only checks call that healthy. It is not; it is a
+    working mechanism with nothing to say.
+
+    Advisory by design: an empty corpus is a legitimate state on a fresh machine.
+    These SKIP (never FAIL) so they read as 'known gap, located' rather than
+    'broken' — the distinction that stops a silent partial being mistaken for
+    completeness.
+    """
+    out: list[Check] = []
+    root = Path(os.environ.get("SPOS_ROOT")
+                or os.environ.get("CLAUDE_PROJECT_DIR")
+                or (Path.home() / "SPOS"))
+
+    # -- solutions corpus (consumer: pretooluse-solution-surface.py) ----------
+    key, label = "corpus_solutions", "situational corpus — docs/solutions"
+    sdir = Path(os.environ.get("AOS_CORE_SOLUTIONS_DIR") or (root / "docs" / "solutions"))
+    if not sdir.is_dir():
+        out.append(skip(key, label, f"no corpus at {sdir} — prior-fix surfacing will fire and match nothing"))
+    else:
+        n = sum(1 for _ in sdir.rglob("*.md"))
+        if n == 0:
+            out.append(skip(key, label, f"{sdir} exists but is empty — hook fires, matches nothing"))
+        else:
+            excl = sdir.parent / "SOLUTIONS-EXCLUDED.md"
+            note = ""
+            if excl.is_file():
+                withheld = sum(1 for ln in excl.read_text(errors="ignore").splitlines() if ln.startswith("- `"))
+                if withheld:
+                    note = f"; {withheld} withheld (see {excl.name})"
+            out.append(ok(key, label, f"{n} entr(y/ies) at {sdir}{note}"))
+
+    # -- CLAUDE.md (consumer: Claude Code itself) ----------------------------
+    key, label = "corpus_claude_md", "situational corpus — CLAUDE.md"
+    cmd_path = root / "CLAUDE.md"
+    if cmd_path.is_file():
+        out.append(ok(key, label, f"present at {cmd_path} ({cmd_path.stat().st_size} bytes)"))
+    else:
+        out.append(skip(key, label, f"absent at {cmd_path} — no stable operating rules for this root"))
+
+    # -- handoff series (consumer: session-close skill + Stop hook) ----------
+    key, label = "corpus_handoffs", "situational corpus — session handoffs"
+    hdir = Path(os.environ.get("AOS_CORE_HANDOFFS_DIR") or (root / "docs" / "session-handoffs"))
+    if not hdir.is_dir():
+        out.append(skip(key, label, f"no handoff series at {hdir} — no lane history"))
+    else:
+        n = sum(1 for _ in hdir.glob("*.md"))
+        out.append(ok(key, label, f"{n} handoff(s) at {hdir}") if n
+                   else skip(key, label, f"{hdir} exists but is empty"))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Report rendering
 # ---------------------------------------------------------------------------
 _STATUS_WIDTH = 4  # PASS/FAIL/SKIP
@@ -422,6 +656,9 @@ def run_all_checks() -> list[Check]:
     checks.append(check_bundle_version())  # 5
     checks.extend(check_tooling_leg())  # 6
     checks.extend(check_import_compat())  # 7
+    checks.append(check_live_session())  # 8  (F10)
+    checks.append(check_hooks_invocable())  # 8b (F10)
+    checks.extend(check_situational_corpus())  # 9 (item 16)
     return checks
 
 
