@@ -24,6 +24,7 @@ Exit: 0 built, 1 bad input, 2 nothing shippable (every candidate was excluded).
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import shutil
@@ -125,30 +126,44 @@ SHARP = ["political-risk", "blind spot", "resistance point", "under-resourced",
          "overloaded", "ally under strain", "threatened", "incompetent", "liability"]
 
 
-def folio_clean(text: str) -> tuple[str, list[str]]:
-    """Strip third-party figures; report verdict-language lines. Same contract as the
-    bundle builder's folio_normalize — figures are mechanical, phrasing is judgment."""
-    out, sharp = [], []
+def sharp_hits(text: str) -> list[str]:
+    """Verdict/assessment-language line hits (SHARP terms). Extracted as a standalone
+    function (2026-07-28, org-analysis slice) so it is a SINGLE definition shared by
+    two consumers that need it for different purposes: `folio_clean` below (intel —
+    flag-and-ship) and the org-analysis candidate gate (hold-and-exclude), plus
+    corpus_return.py's inbound gate battery, which imports this module the same way
+    it already imports `category_hits`. One definition, three consumers — a fix to
+    any one of them is a fix to all three (same precedent as _CATEGORY_DETECTORS)."""
+    hits = []
     for i, line in enumerate(text.splitlines(), 1):
-        if COMP_CTX.search(line) and MONEY_RE.search(line):
-            line = MONEY_RE.sub("[figure withheld]", line)
         low = line.lower()
         for term in SHARP:
             if term in low:
-                sharp.append(f"L{i}: {term}")
+                hits.append(f"L{i}: {term}")
                 break
+    return hits
+
+
+def folio_clean(text: str) -> tuple[str, list[str]]:
+    """Strip third-party figures; report verdict-language lines. Same contract as the
+    bundle builder's folio_normalize — figures are mechanical, phrasing is judgment."""
+    out = []
+    for line in text.splitlines():
+        if COMP_CTX.search(line) and MONEY_RE.search(line):
+            line = MONEY_RE.sub("[figure withheld]", line)
         out.append(line)
-    return "\n".join(out), sharp
+    return "\n".join(out), sharp_hits(text)
 
 
 def _reason_class(hits: list[str]) -> str:
     """Collapse exclusion hits to a shippable reason CLASS (U3): never the token,
-    never the specific category — only denylist / category / unclassified-currency."""
+    never the specific category — only denylist / category / unclassified-currency /
+    verdict-language."""
     classes = set()
     for h in hits:
         if h.startswith("category:"):
             classes.add("category")
-        elif h == "unclassified-currency":
+        elif h in ("unclassified-currency", "verdict-language"):
             classes.add(h)
         else:
             classes.add("denylist")
@@ -207,6 +222,10 @@ def main() -> int:
     for label, root, keep in (
         ("intel", home / "data" / "intel", lambda r: not EPHEMERAL_INTEL.search(r)),
         ("handoffs", home / "docs" / "session-handoffs", lambda r: bool(SP_RELEVANT.search(r))),
+        # org-analysis (2026-07-28, DESIGN-org-analysis-cadence): the README states the
+        # contract, not analysis content — it is never a build candidate, same as it is
+        # never a shipped file or an EXCLUDED.md row.
+        ("org-analysis", home / "data" / "org-analysis", lambda r: r != "README.md"),
     ):
         if not root.is_dir():
             continue
@@ -216,8 +235,8 @@ def main() -> int:
                 text = f.read_text(errors="ignore")
             except OSError:
                 continue
-            # handoffs match on CONTENT (filenames are mission slugs); intel on name.
-            probe: str = rel_s if label == "intel" else rel_s + "\n" + text[:4000]
+            # handoffs match on CONTENT (filenames are mission slugs); intel/org-analysis on name.
+            probe: str = rel_s if label != "handoffs" else rel_s + "\n" + text[:4000]
             if not keep(probe):
                 continue
             if scan(text, banned):
@@ -227,13 +246,21 @@ def main() -> int:
             if cat_e:
                 excluded.append((Path(label) / rel_s, [f"category:{c}" for c in cat_e]))
                 continue
-            # Intel carrying bare currency is held: these are third-party deal/revenue
-            # figures from meetings, not obviously comp, and folio_clean only strips
-            # currency ADJACENT to comp context. Whether a counterparty's deal size
-            # travels to employer hardware is Ben's call, not a regex's — so hold and
-            # report rather than guess in either direction.
-            if label == "intel" and re.search(r"\$\s?\d", text):
+            # Intel and org-analysis carrying bare currency are held: these are
+            # third-party deal/revenue/comp figures, not obviously comp-contextual, and
+            # folio_clean only strips currency ADJACENT to comp context. Whether a
+            # figure travels to employer hardware is Ben's call, not a regex's — so
+            # hold and report rather than guess in either direction.
+            if label in ("intel", "org-analysis") and re.search(r"\$\s?\d", text):
                 excluded.append((Path(label) / rel_s, ["unclassified-currency"]))
+                continue
+            # org-analysis divergence from intel (§2 of the design, deliberate): intel
+            # FLAGS verdict language and ships the file, because intel is mostly about
+            # events that happen to involve people. Org-analysis is about people by
+            # definition — there is no incidental case — so a SHARP hit HOLDS the whole
+            # file rather than flagging it. Reason class only, never the matched term.
+            if label == "org-analysis" and sharp_hits(text):
+                excluded.append((Path(label) / rel_s, ["verdict-language"]))
                 continue
             extra.append((label, f, Path(label) / rel_s))
 
@@ -246,7 +273,7 @@ def main() -> int:
         # intel/ and handoffs/ is exactly how excluded PHI persisted in the payload
         # (work-mac U1). Everything else under out/ (inbound/, business/) belongs to
         # other writers and must never be touched here.
-        for owned in (dest, out / "intel", out / "handoffs"):
+        for owned in (dest, out / "intel", out / "handoffs", out / "org-analysis"):
             if owned.exists():
                 shutil.rmtree(owned)
         for rel in shipped:
@@ -255,13 +282,24 @@ def main() -> int:
             shutil.copy2(src / rel, tgt)
         for label, f, rel in extra:
             body = f.read_text(errors="ignore")
-            if label == "intel":       # intel is ABOUT people — folio rules apply
+            if label in ("intel", "org-analysis"):   # both slices are ABOUT people — folio rules apply
                 body, sharp = folio_clean(body)
+                # org-analysis SHARP hits are excluded upstream (candidate loop) so this
+                # should always be empty here — defense in depth, verbatim intel precedent.
                 if sharp:
                     sharp_flagged.append(f"{rel}: {', '.join(sharp[:2])}")
             tgt_path = out / rel
             tgt_path.parent.mkdir(parents=True, exist_ok=True)
             tgt_path.write_text(body, encoding="utf-8")
+        # org-analysis stamps .last-build EVERY build, including an empty slice — that
+        # is the whole point of the amendment: absence-of-change must be provable and
+        # distinct from absence-of-pipeline. mkdir is safe even after the rmtree above
+        # left the dir absent, and even if no org-analysis file shipped this run.
+        org_out = out / "org-analysis"
+        org_out.mkdir(parents=True, exist_ok=True)
+        (org_out / ".last-build").write_text(
+            datetime.datetime.now(datetime.timezone.utc).isoformat() + "\n", encoding="utf-8"
+        )
         if sharp_flagged:
             # Named, not silently shipped and not silently dropped — same contract as
             # the bundle's folio gate. These need a human reword in the SOURCE.
@@ -274,7 +312,8 @@ def main() -> int:
         (out / "EXCLUDED.md").write_text(
             "# Excluded from the situational corpus\n\n"
             f"{len(excluded)} of {len(shipped) + len(excluded)} entries were withheld by the leak\n"
-            "gate: a denylist token, a PII/PHI category detector, or unclassified currency.\n"
+            "gate: a denylist token, a PII/PHI category detector, unclassified currency, or\n"
+            "(org-analysis only) verdict/assessment language.\n"
             "Withheld means ABSENT — the build fails if any listed file is present in the\n"
             "payload (U3: this manifest is only useful if it can be believed). They are\n"
             "NOT lost — they live on the personal Mac. If one is needed work-side, it must\n"

@@ -77,24 +77,41 @@ INBOUND = [
 CORPUS_ROOT = Path(os.environ.get("CORPUS_RETURN_ROOT") or AOS / "docs" / "solutions")
 DEST = Path(os.environ.get("CORPUS_RETURN_DEST") or CORPUS_ROOT / "work-authored")
 MANIFEST = AOS / "PERSONAL" / "bundle.manifest.json"
+# Work-Mac-reachable fallback: bootstrap.sh installs the identity bundle to
+# ~/.aos-private (renamed from the shipped aos-private-work/ dir), which carries its
+# own banned_tokens.txt. The work Mac has no PERSONAL/, so the manifest is never
+# reachable there — same precedent as nas-sync.sh's G4 gate (manifest canonical,
+# bundle copy fallback only where the manifest can't exist).
+BUNDLE_BANNED = Path(os.environ.get("CORPUS_RETURN_BUNDLE_BANNED") or Path.home() / ".aos-private" / "banned_tokens.txt")
 SKIP_NAMES = {"README.md", "INDEX.md"}
 
 
-def _load_gate() -> tuple[list[str], object]:
-    """Banned tokens + the shared category detector. Fail-closed on either."""
-    if not MANIFEST.is_file():
-        raise SystemExit(f"ERROR: manifest missing ({MANIFEST}) — refusing to merge ungated.")
-    banned = [t.strip() for t in json.loads(MANIFEST.read_text()).get("banned_tokens", []) if t.strip()]
+def _load_gate() -> tuple[list[str], object, str]:
+    """Banned tokens + the shared category detector. Fail-closed only when NEITHER
+    token source is reachable — manifest is canonical (personal Mac), bundle copy is
+    the fallback (work Mac, where PERSONAL/ never exists). Returns which source fired
+    so callers can name it in output rather than merging/checking silently."""
+    banned: list[str] = []
+    source = ""
+    if MANIFEST.is_file():
+        banned = [t.strip() for t in json.loads(MANIFEST.read_text()).get("banned_tokens", []) if t.strip()]
+        source = f"manifest ({MANIFEST})"
+    elif BUNDLE_BANNED.is_file():
+        banned = [ln.strip() for ln in BUNDLE_BANNED.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+        source = f"bundle copy ({BUNDLE_BANNED})"
     if not banned:
-        raise SystemExit("ERROR: banned_tokens empty — refusing to merge ungated.")
+        raise SystemExit(
+            f"ERROR: no banned-token source reachable (manifest: {MANIFEST}, "
+            f"bundle copy: {BUNDLE_BANNED}) — refusing to run ungated."
+        )
     spec = importlib.util.spec_from_file_location("_bsc", Path(__file__).parent / "build_sp_context.py")
     if not spec or not spec.loader:
-        raise SystemExit("ERROR: cannot load category detectors — refusing to merge ungated.")
+        raise SystemExit("ERROR: cannot load category detectors — refusing to run ungated.")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     if not getattr(mod, "_CATEGORY_DETECTORS", None):
-        raise SystemExit("ERROR: category detectors empty — refusing to merge ungated.")
-    return banned, mod
+        raise SystemExit("ERROR: category detectors empty — refusing to run ungated.")
+    return banned, mod, source
 
 
 def _sha_full(text: str) -> str:
@@ -145,7 +162,8 @@ def main() -> int:
     if args.check_only and args.merge:
         raise SystemExit("ERROR: --check-only and --merge are mutually exclusive.")
 
-    banned, gate = _load_gate()
+    banned, gate, gate_source = _load_gate()
+    print(f"  gate source: {gate_source}")  # c1-ok
     sources = [d for d in INBOUND if d.is_dir()]
     if not sources:
         print("  no inbound dir reachable (NAS mounted?) — nothing to do")  # c1-ok
@@ -166,9 +184,17 @@ def main() -> int:
 
             hits = [t for t in banned if re.search(re.escape(t), text, re.I)]
             cats = gate.category_hits(text)  # type: ignore[attr-defined]
-            if hits or cats:
+            # SHARP detector on the inbound leg too (2026-07-28, work-mac amendment to
+            # DESIGN-org-analysis-cadence): the outbound org-analysis gate holds verdict/
+            # assessment language rather than shipping it, and the work Mac must not be
+            # able to author that same class of content and hand it back through the
+            # return lane unchallenged. Reuses the SAME sharp_hits() the outbound gate
+            # uses (imported off `gate`, same module already loaded for category_hits) —
+            # one definition, both directions, so a fix to either is a fix to both.
+            sharp = gate.sharp_hits(text)  # type: ignore[attr-defined]
+            if hits or cats or sharp:
                 blocked += 1
-                print(f"  BLOCKED {f.name}  denylist={hits} category={cats}")  # c1-ok
+                print(f"  BLOCKED {f.name}  denylist={hits} category={cats} sharp={sharp}")  # c1-ok
                 continue
 
             h = _sha_full(text)

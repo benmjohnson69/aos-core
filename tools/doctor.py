@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """aos-core doctor — answers "is the whole stool green?"
 
-Checks nine concern areas and reports PASS / FAIL / SKIP for each.
+Checks ten concern areas and reports PASS / FAIL / SKIP for each.
 Exit 0 iff no FAILs. --json emits machine-readable JSON.
 
 Usage:
@@ -782,6 +782,69 @@ def check_situational_corpus() -> list[Check]:
 
 
 # ---------------------------------------------------------------------------
+# Check 10 — discipline pack present + current
+# ---------------------------------------------------------------------------
+def _discipline_version(text: str) -> int | None:
+    """Extract `<!-- discipline_version: N -->` from a doc's header. None if absent/malformed."""
+    m = re.search(r"discipline_version:\s*(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
+def check_discipline_pack() -> Check:
+    """OPERATING-DISCIPLINE.md must ship with the plugin. Mirrors the Check 5
+    (bundle vs drive) pattern: presence is the hard requirement (FAIL if absent);
+    freshness vs a reachable drive mirror is best-effort (SKIP, never FAIL, when
+    the mirror isn't reachable — an unprobeable comparison is not a broken one)."""
+    key, label = "discipline_pack", "operating discipline pack"
+    doc_path = PLUGIN_ROOT / "OPERATING-DISCIPLINE.md"
+
+    if not doc_path.is_file():
+        return fail(key, label, f"missing: {doc_path}")
+
+    try:
+        local_text = doc_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return fail(key, label, f"present but unreadable: {exc}")
+
+    local_version = _discipline_version(local_text)
+    if local_version is None:
+        return fail(key, label, f"present at {doc_path} but missing/malformed `discipline_version` header")
+
+    drive_dir_str = os.environ.get("AOS_CORE_DRIVE_DIR", "")
+    if not drive_dir_str:
+        return ok(key, label, f"present at {doc_path} (discipline_version={local_version}); "
+                                "AOS_CORE_DRIVE_DIR not set — freshness vs mirror not probed")
+
+    drive_dir = Path(drive_dir_str)
+    if not drive_dir.is_dir():
+        return ok(key, label, f"present at {doc_path} (discipline_version={local_version}); "
+                                f"AOS_CORE_DRIVE_DIR set but not reachable: {drive_dir} — freshness not probed")
+
+    mirror_path = drive_dir / "OPERATING-DISCIPLINE.md"
+    if not mirror_path.is_file():
+        return ok(key, label, f"present at {doc_path} (discipline_version={local_version}); "
+                                f"no mirror copy found at {mirror_path} to compare against")
+
+    try:
+        mirror_text = mirror_path.read_text(encoding="utf-8")
+    except OSError:
+        return ok(key, label, f"present at {doc_path} (discipline_version={local_version}); "
+                                f"mirror at {mirror_path} unreadable — freshness not probed")
+
+    mirror_version = _discipline_version(mirror_text)
+    if mirror_version is None:
+        return ok(key, label, f"present at {doc_path} (discipline_version={local_version}); "
+                                f"mirror at {mirror_path} has no discipline_version header — treating local as current")
+
+    if mirror_version > local_version:
+        return fail(key, label, f"stale — installed discipline_version={local_version}, "
+                                  f"mirror at {mirror_path} has discipline_version={mirror_version}")
+
+    return ok(key, label, f"current — installed discipline_version={local_version} "
+                            f"(mirror at {mirror_path}: {mirror_version})")
+
+
+# ---------------------------------------------------------------------------
 # Report rendering
 # ---------------------------------------------------------------------------
 _STATUS_WIDTH = 4  # PASS/FAIL/SKIP
@@ -819,6 +882,7 @@ def run_all_checks(live: bool = False) -> list[Check]:
     checks.append(check_live_session())  # 8  (F10)
     checks.append(check_hooks_invocable())  # 8b (F10)
     checks.extend(check_situational_corpus())  # 9 (item 16)
+    checks.append(check_discipline_pack())  # 10
     return checks
 
 
