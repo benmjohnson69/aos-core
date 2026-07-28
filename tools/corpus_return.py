@@ -32,7 +32,13 @@ CONTRACT
       overwrite is the exact failure this tool exists to prevent.
 
 Usage:
-    python3 corpus_return.py --check     # what would merge
+    python3 corpus_return.py             # what would merge (default; zero writes)
+    python3 corpus_return.py --check-only # same run, gate-convention exit code: 0 = all would
+                                          # ship clean, 2 = at least one blocked. For the work Mac
+                                          # to self-verify a return BEFORE shipping it — the check
+                                          # path used to be reachable only via the merge flow, so
+                                          # "did I pass the gate" required standing up a real merge
+                                          # to find out. Zero writes either way.
     python3 corpus_return.py --merge
 
 Env overrides (testing / alternate trees; unset = the real paths above):
@@ -131,7 +137,13 @@ def _rel(p: Path) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Merge work-authored corpus entries home.")
     ap.add_argument("--merge", action="store_true", help="write; default is check-only")
+    ap.add_argument(
+        "--check-only", action="store_true",
+        help="explicit self-verify: zero writes, exit 2 if anything is blocked (else 0)",
+    )
     args = ap.parse_args()
+    if args.check_only and args.merge:
+        raise SystemExit("ERROR: --check-only and --merge are mutually exclusive.")
 
     banned, gate = _load_gate()
     sources = [d for d in INBOUND if d.is_dir()]
@@ -205,6 +217,8 @@ def main() -> int:
     )
     if not args.merge and merged:
         print("  (re-run with --merge to write)")  # c1-ok
+    if args.check_only and (blocked or collisions):
+        return 2
     return 0
 
 
