@@ -280,7 +280,7 @@ def check_bundle_version() -> Check:
 # ---------------------------------------------------------------------------
 # Check 6 — tooling leg
 # ---------------------------------------------------------------------------
-def check_tooling_leg() -> list[Check]:
+def check_tooling_leg(live: bool = False) -> list[Check]:
     """tool-route-injector.py present, tool_routes.json valid, webfetch MCP registered."""
     results: list[Check] = []
 
@@ -303,16 +303,79 @@ def check_tooling_leg() -> list[Check]:
         results.append(fail("tooling_routes", "tool_routes.json", f"not found at {routes_path}"))
 
     # webfetch MCP
-    results.append(_check_webfetch_mcp())
+    results.append(_check_webfetch_mcp_live() if live else _check_webfetch_mcp_config())
     return results
 
 
-def _check_webfetch_mcp() -> Check:
+def _check_webfetch_mcp_config() -> Check:
+    """Primary probe: read MCP registration off disk — instant, no subprocess.
+
+    A `claude mcp list` SKIP that never resolves (10s timeout hit daily on the
+    work Mac) trains readers to ignore the row. Reading config directly is
+    what the CLI itself does to build its list, so it's equally authoritative
+    and doesn't depend on a live process/timeout budget. `--live` still runs
+    the deeper subprocess probe on request.
+    """
+    label = "webfetch MCP registered"
+    key = "tooling_webfetch"
+    server_name = "webfetch"
+    candidates: list[tuple[str, dict]] = []
+
+    claude_json = Path.home() / ".claude.json"
+    if claude_json.is_file():
+        try:
+            data = json.loads(claude_json.read_text(encoding="utf-8"))
+        except ValueError:
+            data = {}
+        top_servers = data.get("mcpServers", {})
+        if server_name in top_servers:
+            candidates.append(("~/.claude.json (top-level mcpServers)", top_servers[server_name]))
+        cwd = str(Path.cwd())
+        proj_servers = data.get("projects", {}).get(cwd, {}).get("mcpServers", {})
+        if server_name in proj_servers:
+            candidates.append((f"~/.claude.json projects[{cwd}].mcpServers", proj_servers[server_name]))
+
+    project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+    if project_dir:
+        mcp_json = Path(project_dir) / ".mcp.json"
+        if mcp_json.is_file():
+            try:
+                pdata = json.loads(mcp_json.read_text(encoding="utf-8"))
+            except ValueError:
+                pdata = {}
+            pservers = pdata.get("mcpServers", {})
+            if server_name in pservers:
+                candidates.append((str(mcp_json), pservers[server_name]))
+
+    if not candidates:
+        return fail(
+            key,
+            label,
+            "webfetch not found in ~/.claude.json (top-level or projects[cwd]) "
+            "or $CLAUDE_PROJECT_DIR/.mcp.json [config-read mode]",
+        )
+
+    source, cfg = candidates[0]
+    cmd = cfg.get("command")
+    if not cmd:
+        # url/sse-type transport — no local executable to validate.
+        return ok(key, label, f"webfetch registered in {source} (transport={cfg.get('type', 'unknown')}) [config-read mode]")
+
+    cmd_path = Path(cmd)
+    if not cmd_path.is_file():
+        return fail(key, label, f"webfetch registered in {source} but command not found: {cmd} [config-read mode]")
+    if not os.access(cmd_path, os.X_OK):
+        return fail(key, label, f"webfetch registered in {source} but command not executable: {cmd} [config-read mode]")
+    return ok(key, label, f"webfetch registered in {source}, command executable at {cmd} [config-read mode]")
+
+
+def _check_webfetch_mcp_live() -> Check:
+    """Deeper probe: shell out to `claude mcp list` (subprocess, 10s budget)."""
     label = "webfetch MCP registered"
     key = "tooling_webfetch"
     claude_bin = shutil.which("claude")
     if not claude_bin:
-        return skip(key, label, "claude CLI not on PATH — cannot check MCP list")
+        return skip(key, label, "claude CLI not on PATH — cannot check MCP list [live mode]")
     try:
         result = subprocess.run(
             [claude_bin, "mcp", "list"],
@@ -322,13 +385,13 @@ def _check_webfetch_mcp() -> Check:
         )
         output = result.stdout + result.stderr
         if re.search(r"\bwebfetch\b", output, re.IGNORECASE):
-            return ok(key, label, "webfetch found in `claude mcp list`")
+            return ok(key, label, "webfetch found in `claude mcp list` [live mode]")
         else:
-            return fail(key, label, "webfetch NOT found in `claude mcp list`")
+            return fail(key, label, "webfetch NOT found in `claude mcp list` [live mode]")
     except subprocess.TimeoutExpired:
-        return skip(key, label, "claude mcp list timed out after 10s")
+        return skip(key, label, "claude mcp list timed out after 10s [live mode]")
     except OSError as exc:
-        return skip(key, label, f"could not invoke claude CLI: {exc}")
+        return skip(key, label, f"could not invoke claude CLI: {exc} [live mode]")
 
 
 # ---------------------------------------------------------------------------
@@ -744,14 +807,14 @@ def render_summary(checks: list[Check]) -> str:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def run_all_checks() -> list[Check]:
+def run_all_checks(live: bool = False) -> list[Check]:
     checks: list[Check] = []
     checks.extend(check_tooling_binaries())  # 1
     checks.append(check_hooks_registered())  # 2
     checks.append(check_hooks_fire())  # 3
     checks.extend(check_identity_bundle())  # 4
     checks.append(check_bundle_version())  # 5
-    checks.extend(check_tooling_leg())  # 6
+    checks.extend(check_tooling_leg(live=live))  # 6
     checks.extend(check_import_compat())  # 7
     checks.append(check_live_session())  # 8  (F10)
     checks.append(check_hooks_invocable())  # 8b (F10)
@@ -762,9 +825,15 @@ def run_all_checks() -> list[Check]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="aos-core doctor — health check for the three-legged stool")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of the human table")
+    ap.add_argument(
+        "--live",
+        action="store_true",
+        help="use the deeper `claude mcp list` subprocess probe for MCP registration "
+        "instead of the default instant on-disk config read",
+    )
     args = ap.parse_args()
 
-    checks = run_all_checks()
+    checks = run_all_checks(live=args.live)
     fails = [c for c in checks if c.status == FAIL]
 
     if args.json:
