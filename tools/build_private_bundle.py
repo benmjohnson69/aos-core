@@ -219,6 +219,15 @@ CATEGORY_DETECTORS: list[tuple[str, "re.Pattern[str]"]] = [
         r"|\b(?:mg|mcg)\s+(?:daily|twice|nightly|fasted|AM|PM)\b", re.I)),
     ("dosage-schedule", re.compile(r"\b\d+\s?(?:mg|mcg|ml|iu)\b", re.I)),
     ("genotype", re.compile(r"\b[A-Z]{2,5}\d?\s+[ACGT]{2}\b|\bgenotype\b|\brs\d{4,}\b")),
+    # Clinical-discussion shape. Generic stems miss compound drug names ("methylene
+    # blue", "bempedoic acid") that carry no -cillin/-statin suffix, and enumerating
+    # them would put the principal's own regimen back into a shipped file. Drug CLASSES
+    # and interaction vocabulary are neither personal nor guessable, and they are what
+    # a medication-interaction analysis actually reads like.
+    ("clinical-context", re.compile(
+        r"\b(?:MAOI|SSRI|SNRI|NSAID|ACE inhibitor|anticoagulant|antiplatelet|"
+        r"contraindicat\w*|drug[- ]interaction|LFT\b|hepatotox\w*|bleeding risk|"
+        r"chronic[- ]use plan|fasted\s+\d|titrat\w*)\b", re.I)),
     ("home-address", re.compile(r"\b\d{1,5}\s+\w+\s+(?:Drive|Dr|Street|St|Road|Rd|Lane|Ln|Ave|Avenue|Court|Ct)\b", re.I)),
 ]
 
