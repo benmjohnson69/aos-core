@@ -218,6 +218,7 @@ def main() -> int:
     # ── extra slices: intel (folio-treated) + SP-relevant handoffs ──────────────
     extra: list[tuple[str, Path, Path]] = []   # (label, src_file, dest_rel)
     sharp_flagged: list[str] = []
+    figures_stripped: list[str] = []
     home = Path.home() / "aos"
     for label, root, keep in (
         ("intel", home / "data" / "intel", lambda r: not EPHEMERAL_INTEL.search(r)),
@@ -246,14 +247,37 @@ def main() -> int:
             if cat_e:
                 excluded.append((Path(label) / rel_s, [f"category:{c}" for c in cat_e]))
                 continue
-            # Intel and org-analysis carrying bare currency are held: these are
-            # third-party deal/revenue/comp figures, not obviously comp-contextual, and
-            # folio_clean only strips currency ADJACENT to comp context. Whether a
-            # figure travels to employer hardware is Ben's call, not a regex's — so
-            # hold and report rather than guess in either direction.
+            # Intel and org-analysis carrying bare currency: strip-then-verify
+            # (2026-07-28 design note — the prior all-or-nothing hold meant ANY $-figure
+            # sank the whole file, so folio_clean's substitution never got a chance to
+            # engage on $-content). folio_clean only strips currency ADJACENT to comp
+            # context — that distinction is unchanged. Run the substitution, then
+            # re-run the SAME currency detector on the CLEANED text: the transform
+            # carries its own fail-oracle. Clean -> ship the derivative (folio_clean
+            # runs again, idempotently, at build time below) and record as
+            # figures-stripped, visible in the manifest, not silent. Still dirty
+            # (substitution missed a $-form, or a non-comp-adjacent bare figure) ->
+            # hold exactly as before, unchanged fail-closed behavior. A file that ALSO
+            # trips SHARP (org-analysis only) is a combo case: hold as today, no
+            # substitution attempt.
             if label in ("intel", "org-analysis") and re.search(r"\$\s?\d", text):
-                excluded.append((Path(label) / rel_s, ["unclassified-currency"]))
-                continue
+                combo_sharp = label == "org-analysis" and bool(sharp_hits(text))
+                if combo_sharp:
+                    excluded.append((Path(label) / rel_s, ["unclassified-currency"]))
+                    continue
+                # Verification-driven correction (pass-oracle failed on first run):
+                # folio_clean strips only comp-ADJACENT figures, so a bare deal
+                # figure — the exact case this path exists for — never got stripped
+                # and the ship path was unreachable. On THIS path every MONEY_RE
+                # match is stripped: the file already tripped the currency check,
+                # so all its figures are third-party money on employer hardware.
+                # The re-scan below stays as the transform's fail-oracle.
+                cleaned, _ = folio_clean(text)
+                cleaned = MONEY_RE.sub("[figure withheld]", cleaned)
+                if re.search(r"\$\s?\d", cleaned):
+                    excluded.append((Path(label) / rel_s, ["unclassified-currency"]))
+                    continue
+                figures_stripped.append(str(Path(label) / rel_s))
             # org-analysis divergence from intel (§2 of the design, deliberate): intel
             # FLAGS verdict language and ships the file, because intel is mostly about
             # events that happen to involve people. Org-analysis is about people by
@@ -288,6 +312,17 @@ def main() -> int:
                 # should always be empty here — defense in depth, verbatim intel precedent.
                 if sharp:
                     sharp_flagged.append(f"{rel}: {', '.join(sharp[:2])}")
+            if str(rel) in figures_stripped:
+                # The candidate gate verified a THROWAWAY cleaned copy; without this,
+                # the artifact ships the ORIGINAL body with figures intact — the exact
+                # check-vs-artifact divergence (U1 class) this gate exists to prevent.
+                # Same substitution as the gate, plus a write-time fail-oracle: if any
+                # $-figure survives, HOLD the file rather than write it.
+                body = MONEY_RE.sub("[figure withheld]", body)
+                if re.search(r"\$\s?\d", body):
+                    excluded.append((Path(str(rel)), ["unclassified-currency"]))
+                    figures_stripped.remove(str(rel))
+                    continue
             tgt_path = out / rel
             tgt_path.parent.mkdir(parents=True, exist_ok=True)
             tgt_path.write_text(body, encoding="utf-8")
@@ -305,6 +340,13 @@ def main() -> int:
             # the bundle's folio gate. These need a human reword in the SOURCE.
             print(f"  folio: {len(sharp_flagged)} intel line(s) carry verdict language:", file=sys.stderr)  # c1-ok
             for s in sharp_flagged[:8]:
+                print(f"    {s}", file=sys.stderr)  # c1-ok
+        if figures_stripped:
+            # Same U3 visibility contract: shipped-but-transformed is not shipped-quiet.
+            print(f"  folio: {len(figures_stripped)} entr"  # c1-ok
+                  f"{'y' if len(figures_stripped) == 1 else 'ies'} shipped with figures stripped:",
+                  file=sys.stderr)
+            for s in figures_stripped[:8]:
                 print(f"    {s}", file=sys.stderr)  # c1-ok
         # Ship the exclusion list WITH the corpus. The receiving machine must know
         # its knowledge has holes and where they are — a silently-truncated corpus
@@ -324,6 +366,22 @@ def main() -> int:
             # withheld file contains). The operator sees full detail on stdout at build
             # time; the receiver only needs to know WHICH entries are missing and roughly why.
             + "".join(f"- `{f}` — withheld ({_reason_class(h)})\n" for f, h in excluded)
+            + (
+                # figures-stripped (2026-07-28 strip-then-verify): these files SHIP —
+                # unlike everything above they are present in the payload — but their
+                # text was transformed (currency figures replaced with
+                # "[figure withheld]"). Shipped-but-transformed must be visible, not
+                # silent, same U3 logic as withheld: a receiver who doesn't know a file
+                # was edited can't tell a redaction from an omission if it ever matters.
+                (
+                    f"\n## Figures stripped (shipped, transformed)\n\n"
+                    f"{len(figures_stripped)} entr{'y' if len(figures_stripped) == 1 else 'ies'} shipped with "
+                    "currency figures replaced by `[figure withheld]` after re-verification "
+                    "confirmed no `$`-figure survived the substitution:\n\n"
+                    + "".join(f"- `{f}`\n" for f in figures_stripped)
+                )
+                if figures_stripped else ""
+            )
             + "\nRegenerate: `python3 aos-core/tools/build_sp_context.py --out <pkg>/sp-context`\n",
             encoding="utf-8",
         )
