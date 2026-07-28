@@ -88,6 +88,8 @@ echo "      Bundle built + gate passed: ${BUNDLE_TMP}/bundle" >&2
 echo "[2/5] Determining next version number..." >&2
 
 NEXT_VERSION=1
+LATEST_TGZ=""
+LATEST_NUM=0
 for f in "${DRIVE_DIR}"/aos-private-work-v*.tgz; do
     [[ -f "${f}" ]] || continue
     fname="$(basename "${f}")"
@@ -96,6 +98,10 @@ for f in "${DRIVE_DIR}"/aos-private-work-v*.tgz; do
         num="${BASH_REMATCH[1]}"
         if (( num >= NEXT_VERSION )); then
             NEXT_VERSION=$(( num + 1 ))
+        fi
+        if (( num > LATEST_NUM )); then
+            LATEST_NUM=${num}
+            LATEST_TGZ="${f}"
         fi
     fi
 done
@@ -129,7 +135,51 @@ print(hashlib.sha256(combined).hexdigest())
 PYH
 )"
 
-cat > "${BUNDLE_TMP}/bundle/version.json" <<EOF
+# ---------------------------------------------------------------------------
+# (b2) Skip-if-unchanged: three consecutive bundles (v17/v18/v19, then v20)
+# shipped with identical content_hash — the version number carries no
+# information when the payload hasn't changed, and it forces manual
+# hash-diffing on the install side. Compare CONTENT_HASH against the newest
+# existing bundle's content_hash; if equal, skip stamping/tar/copy below and
+# leave the drive at its current version. aos-core mirror + optional public
+# publish still run unconditionally (below) since code can change without
+# the PERSONAL bundle payload changing.
+# Fail-open: any failure to read the existing bundle's hash (corrupt tgz,
+# missing/unreadable version.json) falls through to a normal emission — the
+# skip path must never block a release.
+# ---------------------------------------------------------------------------
+SKIP_BUNDLE=0
+PREV_HASH=""
+if [[ -n "${LATEST_TGZ}" && -f "${LATEST_TGZ}" ]]; then
+    VJSON_MEMBER="$(tar -tzf "${LATEST_TGZ}" 2>/dev/null | grep -E '(^|/)version\.json$' | grep -v '/\._' | grep -v '^\._' | head -1 || true)"
+    if [[ -n "${VJSON_MEMBER}" ]]; then
+        PREV_VJSON_TMP="$(mktemp)"
+        if tar -xzOf "${LATEST_TGZ}" "${VJSON_MEMBER}" > "${PREV_VJSON_TMP}" 2>/dev/null; then
+            PREV_HASH="$("${PYTHON}" - "${PREV_VJSON_TMP}" <<'PYV'
+import json
+import sys
+
+try:
+    data = json.loads(open(sys.argv[1]).read())
+    print(data.get("content_hash", ""))
+except Exception:
+    print("")
+PYV
+)"
+        fi
+        rm -f "${PREV_VJSON_TMP}"
+    fi
+fi
+
+if [[ -n "${PREV_HASH}" && "${PREV_HASH}" == "${CONTENT_HASH}" ]]; then
+    SKIP_BUNDLE=1
+fi
+
+if [[ "${SKIP_BUNDLE}" -eq 1 ]]; then
+    echo "[2b/5] bundle content unchanged (hash ${CONTENT_HASH:0:12}) — no new bundle emitted; drive stays at v${LATEST_NUM}" >&2
+    TARBALL_NAME="aos-private-work-v${LATEST_NUM}.tgz"
+else
+    cat > "${BUNDLE_TMP}/bundle/version.json" <<EOF
 {
   "version": "v${NEXT_VERSION}",
   "built_at": "${BUILT_AT}",
@@ -139,24 +189,25 @@ cat > "${BUNDLE_TMP}/bundle/version.json" <<EOF
   "content_hash": "${CONTENT_HASH}"
 }
 EOF
-echo "      Stamped version.json: v${NEXT_VERSION} (built_at=${BUILT_AT}, content_hash=${CONTENT_HASH:0:12}...)" >&2
+    echo "      Stamped version.json: v${NEXT_VERSION} (built_at=${BUILT_AT}, content_hash=${CONTENT_HASH:0:12}...)" >&2
 
-# ---------------------------------------------------------------------------
-# (c) Tar to aos-private-work-vN.tgz
-# ---------------------------------------------------------------------------
-TARBALL_NAME="aos-private-work-v${NEXT_VERSION}.tgz"
-TARBALL_PATH="${BUNDLE_TMP}/${TARBALL_NAME}"
+    # -----------------------------------------------------------------------
+    # (c) Tar to aos-private-work-vN.tgz
+    # -----------------------------------------------------------------------
+    TARBALL_NAME="aos-private-work-v${NEXT_VERSION}.tgz"
+    TARBALL_PATH="${BUNDLE_TMP}/${TARBALL_NAME}"
 
-echo "[3/5] Creating tarball: ${TARBALL_NAME}..." >&2
-tar -czf "${TARBALL_PATH}" -C "${BUNDLE_TMP}" bundle
-echo "      Tarball size: $(du -sh "${TARBALL_PATH}" | cut -f1)" >&2
+    echo "[3/5] Creating tarball: ${TARBALL_NAME}..." >&2
+    tar -czf "${TARBALL_PATH}" -C "${BUNDLE_TMP}" bundle
+    echo "      Tarball size: $(du -sh "${TARBALL_PATH}" | cut -f1)" >&2
 
-# ---------------------------------------------------------------------------
-# (d) Copy tarball to DRIVE_DIR
-# ---------------------------------------------------------------------------
-echo "[4/5] Copying tarball to drive: ${DRIVE_DIR}/${TARBALL_NAME}..." >&2
-cp "${TARBALL_PATH}" "${DRIVE_DIR}/${TARBALL_NAME}"
-echo "      Copied." >&2
+    # -----------------------------------------------------------------------
+    # (d) Copy tarball to DRIVE_DIR
+    # -----------------------------------------------------------------------
+    echo "[4/5] Copying tarball to drive: ${DRIVE_DIR}/${TARBALL_NAME}..." >&2
+    cp "${TARBALL_PATH}" "${DRIVE_DIR}/${TARBALL_NAME}"
+    echo "      Copied." >&2
+fi
 
 # ---------------------------------------------------------------------------
 # (e) Rsync plugin tree to DRIVE_DIR/aos-core-mirror/
@@ -230,8 +281,10 @@ PYG
             echo "  [publish] public repo already current — no drift, nothing to push" >&2
         else
             git add -A
+            REPORTED_BUNDLE_VERSION="v${NEXT_VERSION}"
+            [[ "${SKIP_BUNDLE}" -eq 1 ]] && REPORTED_BUNDLE_VERSION="v${LATEST_NUM} (unchanged)"
             git -c user.name="aos-core release" -c user.email="noreply@anthropic.com" \
-                commit -q -m "chore(release): sync plugin tree from staging (bundle v${NEXT_VERSION})"
+                commit -q -m "chore(release): sync plugin tree from staging (bundle ${REPORTED_BUNDLE_VERSION})"
             git push origin HEAD >/dev/null 2>&1
             echo "  [publish] pushed plugin tree to public ($(git rev-parse --short HEAD))" >&2
         fi
@@ -250,8 +303,14 @@ fi
 # ---------------------------------------------------------------------------
 echo "" >&2
 echo "=== Release complete ===" >&2
-echo "  tarball : ${DRIVE_DIR}/${TARBALL_NAME}" >&2
-echo "  mirror  : ${MIRROR_DEST}" >&2
-echo "  version : v${NEXT_VERSION}" >&2
+if [[ "${SKIP_BUNDLE}" -eq 1 ]]; then
+    echo "  tarball : ${DRIVE_DIR}/${TARBALL_NAME} (unchanged — no new bundle emitted)" >&2
+    echo "  mirror  : ${MIRROR_DEST}" >&2
+    echo "  version : v${LATEST_NUM} (unchanged)" >&2
+else
+    echo "  tarball : ${DRIVE_DIR}/${TARBALL_NAME}" >&2
+    echo "  mirror  : ${MIRROR_DEST}" >&2
+    echo "  version : v${NEXT_VERSION}" >&2
+fi
 echo "  publish : ${AOS_CORE_PUBLISH:-0} (1 = pushed plugin tree to public aos-core)" >&2
 echo "" >&2
