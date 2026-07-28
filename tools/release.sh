@@ -109,16 +109,37 @@ if command -v git &>/dev/null && git -C "${PLUGIN_ROOT}" rev-parse HEAD &>/dev/n
 fi
 BUILT_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
+# Content hash of the bundle payload, computed BEFORE version.json is written
+# so version.json (build metadata, not content) is naturally excluded. Same
+# payload bytes -> same hash across rebuilds, regardless of version number.
+CONTENT_HASH="$("${PYTHON}" - "${BUNDLE_TMP}/bundle" <<'PYH'
+import hashlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+lines = []
+for p in sorted(root.rglob("*")):
+    if p.is_file():
+        relpath = p.relative_to(root).as_posix()
+        filehash = hashlib.sha256(p.read_bytes()).hexdigest()
+        lines.append(f"{relpath}:{filehash}")
+combined = "\n".join(lines).encode()
+print(hashlib.sha256(combined).hexdigest())
+PYH
+)"
+
 cat > "${BUNDLE_TMP}/bundle/version.json" <<EOF
 {
   "version": "v${NEXT_VERSION}",
   "built_at": "${BUILT_AT}",
   "git_sha": "${GIT_SHA}",
   "profile": "work",
-  "schema": "aos-private-bundle.v1"
+  "schema": "aos-private-bundle.v1",
+  "content_hash": "${CONTENT_HASH}"
 }
 EOF
-echo "      Stamped version.json: v${NEXT_VERSION} (built_at=${BUILT_AT})" >&2
+echo "      Stamped version.json: v${NEXT_VERSION} (built_at=${BUILT_AT}, content_hash=${CONTENT_HASH:0:12}...)" >&2
 
 # ---------------------------------------------------------------------------
 # (c) Tar to aos-private-work-vN.tgz
