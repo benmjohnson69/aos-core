@@ -29,6 +29,23 @@ TTL_SECONDS = 3600
 MAX_MATCHES = 3
 MAX_SNIPPET_CHARS = 300
 
+# Terms that appear in EVERY absolute path, or in nearly every entry, and therefore
+# carry no signal. Without this, a path like /Users/<name>/aos/docs/solutions/x.md
+# contributes `users`, `<name>`, `docs` and `solutions` as needles — which match most
+# of the corpus and drown the one entry that is actually about the file being edited.
+# Precision matters more than recall here: a hook that mostly injects noise trains the
+# reader to skip it, and a skipped hook protects nothing.
+STOP_TERMS = {
+    "users", "home", "aos", "spos", "docs", "solutions", "data", "tools", "src",
+    "main", "test", "tests", "temp", "tmp", "file", "files", "index", "readme",
+    "json", "yaml", "yml", "python", "script", "scripts", "utils", "lib", "common",
+    "claude", "project", "projects", "work", "notes", "draft", "final", "copy",
+}
+# Every component of the home path is in EVERY absolute path on this machine — the
+# username above all. Derived rather than hardcoded: it must not carry a personal
+# identifier in a content-free plugin, and it has to work on any machine/user.
+STOP_TERMS |= {p.lower() for p in Path.home().parts if len(p) >= 4 and p != "/"}
+
 
 def solutions_dir() -> Path:
     env = os.environ.get("AOS_CORE_SOLUTIONS_DIR")
@@ -65,15 +82,16 @@ def _grep(path: str | None, keywords: list[str]) -> list[dict]:
     if not sdir.is_dir():
         return []
     needles: set[str] = set()
+    stem = ""
     if path:
         stem = os.path.basename(path).lower().rsplit(".", 1)[0]
-        if stem:
+        if stem and stem not in STOP_TERMS:
             needles.add(stem)
         for p in [p for p in path.replace("\\", "/").split("/") if p][-3:]:
-            if len(p) >= 4:
+            if len(p) >= 4 and p.lower() not in STOP_TERMS:
                 needles.add(p.lower())
     for k in keywords:
-        if len(k) >= 4:
+        if len(k) >= 4 and k.lower() not in STOP_TERMS:
             needles.add(k.lower())
     if not needles:
         return []
@@ -86,16 +104,29 @@ def _grep(path: str | None, keywords: list[str]) -> list[dict]:
             continue
         lower = text.lower()
         head = lower[:2000]  # frontmatter slice — weighted heavier
+        md_stem = md.stem.lower()
         score = 0
         hit_terms: list[str] = []
         for n in needles:
-            if n in head:
+            # A needle appearing in the ENTRY'S OWN FILENAME is the strongest signal
+            # there is — it means the entry is literally about this thing. Weighted
+            # above frontmatter, which is weighted above body.
+            if n in md_stem:
+                score += 6
+                hit_terms.append(n)
+            elif n in head:
                 score += 3
                 hit_terms.append(n)
             elif n in lower:
                 score += 1
                 hit_terms.append(n)
-        if score <= 0:
+        # PRECISION FLOOR: a single weak body hit is noise, and noise trains people to
+        # ignore the hook — at which point it protects nothing. Require either two
+        # DISTINCT matching terms, or one strong hit (filename/frontmatter). Measured
+        # failure this replaced: editing `tom-ednie-meeting-prep.md` returned a corpus
+        # bootstrap handoff as top match on `benmjohnson, meeting, prep, users`, burying
+        # an entry literally named `...tom-ednie-meeting-followups.md`.
+        if score <= 0 or (len(set(hit_terms)) < 2 and score < 3):
             continue
         snippet = ""
         for n in hit_terms:
