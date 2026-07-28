@@ -141,6 +141,20 @@ def folio_clean(text: str) -> tuple[str, list[str]]:
     return "\n".join(out), sharp
 
 
+def _reason_class(hits: list[str]) -> str:
+    """Collapse exclusion hits to a shippable reason CLASS (U3): never the token,
+    never the specific category — only denylist / category / unclassified-currency."""
+    classes = set()
+    for h in hits:
+        if h.startswith("category:"):
+            classes.add("category")
+        elif h == "unclassified-currency":
+            classes.add(h)
+        else:
+            classes.add("denylist")
+    return ", ".join(sorted(classes))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the situational-context leg (gated per file).")
     ap.add_argument("--out", required=True, type=Path, help="output dir (e.g. releases/sp-mac-v1/sp-context)")
@@ -228,8 +242,13 @@ def main() -> int:
         return 2
 
     if not args.dry_run:
-        if dest.exists():
-            shutil.rmtree(dest)
+        # Wipe ALL builder-owned dirs, not just solutions/ — stale files surviving in
+        # intel/ and handoffs/ is exactly how excluded PHI persisted in the payload
+        # (work-mac U1). Everything else under out/ (inbound/, business/) belongs to
+        # other writers and must never be touched here.
+        for owned in (dest, out / "intel", out / "handoffs"):
+            if owned.exists():
+                shutil.rmtree(owned)
         for rel in shipped:
             tgt = dest / rel
             tgt.parent.mkdir(parents=True, exist_ok=True)
@@ -254,19 +273,36 @@ def main() -> int:
         # reads as "this is everything we know", which is worse than a known gap.
         (out / "EXCLUDED.md").write_text(
             "# Excluded from the situational corpus\n\n"
-            f"{len(excluded)} of {len(shipped) + len(excluded)} entries were withheld because they\n"
-            "contain personal-identifier tokens from the canonical banned list. They are\n"
+            f"{len(excluded)} of {len(shipped) + len(excluded)} entries were withheld by the leak\n"
+            "gate: a denylist token, a PII/PHI category detector, or unclassified currency.\n"
+            "Withheld means ABSENT — the build fails if any listed file is present in the\n"
+            "payload (U3: this manifest is only useful if it can be believed). They are\n"
             "NOT lost — they live on the personal Mac. If one is needed work-side, it must\n"
             "be scrubbed and re-sent deliberately.\n\n"
-            # Deliberately does NOT print which token matched. This file ships, and
-            # echoing the banned value into a shipped artifact reproduces the very
-            # thing the gate exists to keep out (and self-trips the next scan). The
-            # operator sees the tokens on stdout at build time; the receiver only
-            # needs to know WHICH entries are missing.
-            + "".join(f"- `{f}` — {len(h)} personal-token match(es)\n" for f, h in excluded)
+            # Deliberately prints only the reason CLASS — never the matched token (echoing
+            # a banned value into a shipped artifact reproduces the leak and self-trips the
+            # next scan) and never the specific category (naming it reveals what the
+            # withheld file contains). The operator sees full detail on stdout at build
+            # time; the receiver only needs to know WHICH entries are missing and roughly why.
+            + "".join(f"- `{f}` — withheld ({_reason_class(h)})\n" for f, h in excluded)
             + "\nRegenerate: `python3 aos-core/tools/build_sp_context.py --out <pkg>/sp-context`\n",
             encoding="utf-8",
         )
+
+    # PURGE ASSERTION (work-mac U1 ask). The gate builds its exclusion list, but two
+    # separate failure modes have now shipped excluded files anyway: stale files from a
+    # previous build surviving in out/ (only solutions/ was rmtree'd), and the additive
+    # NAS sync retaining receiver-side copies. This closes the first class at the
+    # source: after writing, every excluded path must be ABSENT from the out tree, or
+    # the build fails loudly instead of reporting a clean ship over a dirty payload.
+    if not args.dry_run:
+        stale = [str(rel) for rel, _ in excluded if (out / rel).exists() or (dest / rel).exists()]
+        if stale:
+            print(f"PURGE ASSERTION FAILED — {len(stale)} excluded file(s) still present:", file=sys.stderr)  # c1-ok
+            for s_ in stale[:10]:
+                print(f"  {s_}", file=sys.stderr)  # c1-ok
+            print("  (stale prior build? rm the payload dirs and rebuild)", file=sys.stderr)  # c1-ok
+            return 2
 
     verb = "would ship" if args.dry_run else "shipped"
     print(f"sp-context: {verb} {len(shipped)} entries, excluded {len(excluded)} → {dest}")  # c1-ok

@@ -40,6 +40,15 @@ STOP_TERMS = {
     "main", "test", "tests", "temp", "tmp", "file", "files", "index", "readme",
     "json", "yaml", "yml", "python", "script", "scripts", "utils", "lib", "common",
     "claude", "project", "projects", "work", "notes", "draft", "final", "copy",
+    # Generic English filler that happens to be >=4 chars: individually harmless, but
+    # a filename built entirely of these words (e.g. "no-such-topic-anywhere") clears
+    # the multi-distinct-term floor on co-occurrence alone, since that floor has no
+    # per-term rarity check (unlike the single-term path) — moderately-common domain
+    # words like "meeting"/"sourcepass" (2-3% corpus df) are the actual multi-term
+    # signal, so a df floor there would kill real recall to catch this. Curating the
+    # words out at the needle stage is the narrower fix (work-mac U4 case 6).
+    "such", "topic", "anywhere", "unrelated", "version", "about", "these", "those",
+    "where", "there", "here", "some", "other", "into", "onto", "than", "then",
 }
 # Every component of the home path is in EVERY absolute path on this machine — the
 # username above all. Derived rather than hardcoded: it must not carry a personal
@@ -96,12 +105,18 @@ def _grep(path: str | None, keywords: list[str]) -> list[dict]:
     if not needles:
         return []
 
-    results: list[dict] = []
+    # Candidate rows are collected in one pass; the PRECISION FLOOR below needs each
+    # needle's document frequency across the WHOLE corpus, which isn't known until
+    # every file has been scanned. Filtering happens after this loop, not inside it.
+    candidates: list[dict] = []
+    df: dict[str, int] = {n: 0 for n in needles}
+    total_entries = 0
     for md in sdir.rglob("*.md"):
         try:
             text = md.read_text(errors="ignore")
         except OSError:
             continue
+        total_entries += 1
         lower = text.lower()
         head = lower[:2000]  # frontmatter slice — weighted heavier
         md_stem = md.stem.lower()
@@ -120,13 +135,9 @@ def _grep(path: str | None, keywords: list[str]) -> list[dict]:
             elif n in lower:
                 score += 1
                 hit_terms.append(n)
-        # PRECISION FLOOR: a single weak body hit is noise, and noise trains people to
-        # ignore the hook — at which point it protects nothing. Require either two
-        # DISTINCT matching terms, or one strong hit (filename/frontmatter). Measured
-        # failure this replaced: editing `tom-ednie-meeting-prep.md` returned a corpus
-        # bootstrap handoff as top match on `benmjohnson, meeting, prep, users`, burying
-        # an entry literally named `...tom-ednie-meeting-followups.md`.
-        if score <= 0 or (len(set(hit_terms)) < 2 and score < 3):
+            if n in lower:  # document frequency: presence ANYWHERE makes a term common
+                df[n] += 1
+        if score <= 0:
             continue
         snippet = ""
         for n in hit_terms:
@@ -140,12 +151,36 @@ def _grep(path: str | None, keywords: list[str]) -> list[dict]:
             rel = str(md.relative_to(sdir.parent))
         except ValueError:
             rel = md.name
-        results.append({
+        candidates.append({
             "file": rel,
             "score": score,
             "snippet": snippet[:MAX_SNIPPET_CHARS],
             "matched_terms": sorted(set(hit_terms))[:5],
+            "hit_terms": hit_terms,
         })
+
+    # PRECISION FLOOR: a single weak body hit is noise, and noise trains people to
+    # ignore the hook — at which point it protects nothing. Require either two DISTINCT
+    # matching terms, or one strong hit that is ALSO a rare term corpus-wide. A single
+    # generic term (e.g. `version`, `topic`, `unrelated`) can land a filename-strength
+    # score of 6 purely by appearing in some unrelated entry's filename — length alone
+    # doesn't distinguish "tom-ednie" from "version", so a single-term hit only clears
+    # the floor when the term is long (>=6 chars) AND rare (matches <1% of the corpus).
+    # Measured failure this replaced: editing `tom-ednie-meeting-prep.md` returned a
+    # corpus bootstrap handoff as top match on `benmjohnson, meeting, prep, users`,
+    # burying an entry literally named `...tom-ednie-meeting-followups.md`; the older
+    # single-fix (score>=3) exemption then let `version`/`topic`/`unrelated` through too.
+    df_ceiling = max(1, int(0.01 * total_entries))
+    results: list[dict] = []
+    for row in candidates:
+        distinct = set(row["hit_terms"])
+        if len(distinct) >= 2:
+            results.append(row)
+            continue
+        if row["score"] >= 3:
+            (term,) = distinct
+            if len(term) >= 6 and df.get(term, total_entries) < df_ceiling:
+                results.append(row)
     results.sort(key=lambda r: -r["score"])
     return results[:MAX_MATCHES]
 
