@@ -15,6 +15,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -474,7 +475,12 @@ def check_live_session() -> Check:
 # ---------------------------------------------------------------------------
 # Check 8b — per-hook invocability (F10, complements the live-session probe)
 # ---------------------------------------------------------------------------
-_HOOK_SCRIPT_RE = re.compile(r"([^\s\"']+\.(?:py|sh))")
+# Tokens that precede a script path and are never part of it (interpreter /
+# shell-builtin invocation words). Anything else preceding the script token
+# (that isn't a `-flag`) is presumed to be part of a space-containing path
+# that a naive whitespace split truncated.
+_HOOK_INTERPRETERS = {"python", "python3", "python2", "sh", "bash", "zsh", "env", "source", "."}
+_SCRIPT_SUFFIX_RE = re.compile(r"\.(py|sh)$", re.IGNORECASE)
 
 
 def _iter_registered_hooks(settings: dict) -> list[tuple[str, str]]:
@@ -495,12 +501,91 @@ def _iter_registered_hooks(settings: dict) -> list[tuple[str, str]]:
     return out
 
 
-def _extract_hook_script_path(command: str) -> str | None:
-    """Best-effort extraction of the script path from a hook command string
-    (e.g. 'python3 /path/hook.py' or '$CLAUDE_PROJECT_DIR/hooks/hook.py --flag')."""
+def _script_token_index(tokens: list[str]) -> int | None:
+    for i, tok in enumerate(tokens):
+        if _SCRIPT_SUFFIX_RE.search(tok):
+            return i
+    return None
+
+
+def _extract_script_from_segment(segment: str) -> tuple[str, str] | None:
+    """Find the script token in one (non-'&&') command segment and resolve it
+    to a real path. Returns (status, path) where status is:
+      'found'       — resolved to an existing file
+      'missing'     — a candidate (single-token, or the full literal
+                       reconstruction of a space-split path) confidently does
+                       not exist — report dead with the untruncated path
+      'unparseable' — the command's quoting could not be parsed at all (shlex
+                       failure); named, not guessed, rather than declared dead
+    Returns None if the segment contains no .py/.sh-suffixed token at all."""
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        # Unbalanced quotes etc — cannot trust any reconstruction from this
+        # segment. Best-effort locate a script-looking token to name it, but
+        # report unparseable rather than risk a false-dead verdict.
+        tokens = segment.split()
+        idx = _script_token_index(tokens)
+        if idx is None:
+            return None
+        return ("unparseable", segment.strip())
+
+    if not tokens:
+        return None
+    idx = _script_token_index(tokens)
+    if idx is None:
+        return None
+
+    candidate = tokens[idx]
+    path = Path(os.path.expanduser(candidate))
+    if path.is_file():
+        return ("found", str(path))
+
+    # shlex already honors quotes, so if the true path contained spaces and was
+    # quoted in the command string, `candidate` above is already the full path
+    # and simply doesn't exist (missing). Ambiguity only arises when the path
+    # was UNQUOTED and whitespace split it — collect the preceding tokens that
+    # plausibly belong to it (not an interpreter word, not a `-flag`).
+    ambiguous: list[str] = []
+    j = idx - 1
+    while j >= 0 and tokens[j] not in _HOOK_INTERPRETERS and not tokens[j].startswith("-"):
+        ambiguous.insert(0, tokens[j])
+        j -= 1
+
+    if not ambiguous:
+        return ("missing", str(path))
+
+    # Try progressive rejoins, fullest (most literal) first, in case only part
+    # of the reconstructed run is genuinely the path (e.g. trailing tokens
+    # were actually flags/args, not path fragments).
+    for start in range(len(ambiguous)):
+        joined = " ".join([*ambiguous[start:], candidate])
+        joined_path = Path(os.path.expanduser(joined))
+        if joined_path.is_file():
+            return ("found", str(joined_path))
+
+    # No rejoin combination resolved to a real file. The command string still
+    # only admits one literal reading — every token between the interpreter
+    # and the script suffix, in order — so report that full path as missing
+    # rather than downgrade to unparseable on a segment we can fully parse.
+    full_guess = " ".join([*ambiguous, candidate])
+    return ("missing", full_guess)
+
+
+def _extract_hook_script_path(command: str) -> tuple[str, str] | None:
+    """Resolve the script path from a hook command string, tolerating quoted
+    and unquoted space-containing paths and '&&'-compound commands (e.g.
+    'source venv/bin/activate && python3 /path/hook.py'). See
+    _extract_script_from_segment for the (status, path) contract."""
     expanded = os.path.expandvars(command)
-    m = _HOOK_SCRIPT_RE.search(expanded)
-    return m.group(1) if m else None
+    for segment in expanded.split("&&"):
+        segment = segment.strip()
+        if not segment:
+            continue
+        result = _extract_script_from_segment(segment)
+        if result is not None:
+            return result
+    return None
 
 
 def check_hooks_invocable(settings_path: Path | None = None) -> Check:
@@ -529,14 +614,19 @@ def check_hooks_invocable(settings_path: Path | None = None) -> Check:
         return skip(key, label, "no hooks registered in settings.json — nothing to probe")
 
     dead: list[str] = []
+    unparseable: list[str] = []
     checked = 0
     for event, command in registered:
-        script = _extract_hook_script_path(command)
-        if script is None:
+        resolved = _extract_hook_script_path(command)
+        if resolved is None:
             continue  # not a recognizable script invocation (e.g. inline shell) — not this check's job
-        script_path = Path(script).expanduser()
+        status, path_str = resolved
+        if status == "unparseable":
+            unparseable.append(f"{event}:{path_str}")
+            continue
+        script_path = Path(path_str).expanduser()
         checked += 1
-        if not script_path.is_file():
+        if status == "missing":
             dead.append(f"{event}:{script_path.name} (missing: {script_path})")
             continue
         try:
@@ -554,13 +644,20 @@ def check_hooks_invocable(settings_path: Path | None = None) -> Check:
             stderr_preview = result.stderr[:100].replace("\n", " ")
             dead.append(f"{event}:{script_path.name} (exit {result.returncode}: {stderr_preview})")
 
-    if checked == 0:
+    unparseable_note = ""
+    if unparseable:
+        sample = "; ".join(unparseable[:3])
+        more = f" (+{len(unparseable) - 3} more)" if len(unparseable) > 3 else ""
+        unparseable_note = f"; {len(unparseable)} unparseable (not counted, named): {sample}{more}"
+
+    if checked == 0 and not unparseable:
         return skip(key, label, "no file-based hook commands found to probe")
     if dead:
         sample = "; ".join(dead[:3])
         more = f" (+{len(dead) - 3} more)" if len(dead) > 3 else ""
-        return fail(key, label, f"{len(dead)}/{checked} hook(s) dead: {sample}{more}")
-    return ok(key, label, f"{checked} hook(s) invoked cleanly (exit 0) across {len(registered)} registration(s)")
+        return fail(key, label, f"{len(dead)}/{checked} hook(s) dead: {sample}{more}{unparseable_note}")
+    return ok(key, label,
+              f"{checked} hook(s) invoked cleanly (exit 0) across {len(registered)} registration(s){unparseable_note}")
 
 
 # ---------------------------------------------------------------------------
