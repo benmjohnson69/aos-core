@@ -172,6 +172,7 @@ def main() -> int:
     existing = {p.name: _sha_full(p.read_text(errors="ignore")) for p in DEST.glob("*.md")} if DEST.is_dir() else {}
     corpus = _corpus_index(CORPUS_ROOT)
     merged = skipped = blocked = conflicts = canonical = collisions = 0
+    seen_content: set[str] = set()  # content hashes classified so far THIS RUN — in-batch dedupe
 
     for src in sources:
         for f in sorted(src.glob("*.md")):
@@ -200,6 +201,28 @@ def main() -> int:
             h = _sha_full(text)
             target = DEST / f.name
 
+            # (ii) in-batch dedupe FIRST, before any classification: the same
+            # content staged under a second inbound dir (or a second time under
+            # any name) must not be classified — and counted — twice. Content
+            # identity, not path identity: `seen_content` is keyed by hash alone,
+            # same convention the docstring already uses for cross-path dedupe.
+            if h in seen_content:
+                skipped += 1
+                print(f"  DUPLICATE-STAGED {f.name} (identical content already staged this run) — skipped")  # c1-ok
+                continue
+            seen_content.add(h)
+
+            # (i) DEST target path: identical content already sitting at the
+            # exact name this candidate would land at is canonical, full stop —
+            # no copy, not even a byte-identical overwrite of itself. Real-run
+            # miscount: this used to be checked LAST (after the twins/elsewhere
+            # logic), so a batch's own corpus-index self-registration (below)
+            # could mask it.
+            if existing.get(f.name) == h:
+                canonical += 1
+                print(f"  ALREADY CANONICAL {f.name} at {_rel(target)} (identical content already at destination) — placed nothing")  # c1-ok
+                continue
+
             # Cross-path content check comes BEFORE the same-name check: identical
             # content already in the corpus is identical content, whatever it is called
             # or wherever it sits.
@@ -217,9 +240,6 @@ def main() -> int:
             if elsewhere:
                 canonical += 1
                 print(f"  ALREADY CANONICAL {f.name} at {_rel(elsewhere[0])} — placed nothing")  # c1-ok
-                continue
-            if existing.get(f.name) == h:
-                skipped += 1
                 continue
             if f.name in existing:
                 # Same name, different content. Never overwrite — that is how a
