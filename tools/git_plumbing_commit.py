@@ -23,6 +23,10 @@ Fix: build the commit with plumbing only.
 Sibling of git_atomic_commit.py (Pattern 3). Use this one when the repo is
 under a commit-storm; use git_atomic_commit when you need pre-commit gate
 enforcement (this tool bypasses gates by design — plumbing runs no hooks).
+
+TWO-COPY TOOL: sibling at /Users/benmjohnson/aos/tools/git_plumbing_commit.py.
+A fix here without the sibling is drift — port or note why not. (Caught by
+work-mac drop-#2 review 2026-07-29.)
 """
 
 from __future__ import annotations
@@ -171,6 +175,18 @@ def plumbing_commit(
     Returns (ok, sha) on success or (False, error_string) on failure.
     Retries up to max_retries times when a sibling moves HEAD (CAS miss).
 
+    Failure semantics are all-or-nothing: if ANY requested path fails to
+    stage (add_failed / stage_verify_failed) or any downstream step
+    (write-tree / commit-tree / update-ref) fails, NO commit is created —
+    the temp index is discarded on the early return and the real ref is
+    never touched. A mixed batch (some good paths, some bad) therefore
+    commits nothing, not a partial commit of just the good paths. The
+    process exit code (via `_cli`) is always non-zero in that case; callers
+    chaining `git_plumbing_commit.py ... && next_step` can rely on the `&&`
+    short-circuiting. The one intentionally-non-fatal case is the
+    sync_index WARN below: that fires only AFTER update-ref already
+    succeeded, so the commit landed and exit stays 0 by design.
+
     sync_index (default True): after a successful commit, best-effort stage the
     committed paths into the REAL index (`git update-index --add`). This narrows
     the data-loss window where a sibling committing from a stale real index
@@ -227,6 +243,33 @@ def plumbing_commit(
             rc, _, err = _run(["git", "add", "--", *paths], env=env)
             if rc != 0:
                 return False, f"add_failed: {err}"
+
+            # Belt-and-suspenders: `git add`'s exit code alone is not proof the
+            # content actually landed in the index — e.g. an embedded-repo
+            # warning ("adding embedded git repository") is non-fatal (rc==0)
+            # but silently stages a gitlink instead of the file's content.
+            # Verify every literal FILE path we asked to stage is actually
+            # present in the temp index before trusting rc==0. Directories/
+            # globs are skipped (their staged-name doesn't match the input
+            # pathspec 1:1) — this is a targeted check for the silent-skip
+            # class, not exhaustive pathspec semantics.
+            repo_root = _repo_root()
+            file_paths = [p for p in paths if (repo_root / p).is_file()]
+            if file_paths:
+                lrc, staged_out, lerr = _run(
+                    ["git", "ls-files", "--", *file_paths], env=env
+                )
+                if lrc == 0:
+                    staged_set = set(staged_out.splitlines())
+                    not_staged = [p for p in file_paths if p not in staged_set]
+                    if not_staged:
+                        return False, (
+                            "stage_verify_failed: git add exited 0 but these "
+                            f"paths are not in the staged tree: {not_staged}"
+                        )
+                # lrc != 0: verification command itself failed (abnormal) —
+                # don't block on a secondary check that can't run; the rc
+                # check above already gate-kept the primary failure class.
 
             rc, tree, err = _run(["git", "write-tree"], env=env)
             if rc != 0 or not tree:
