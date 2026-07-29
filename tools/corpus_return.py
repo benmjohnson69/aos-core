@@ -67,8 +67,12 @@ INBOUND = [
         os.environ["CORPUS_RETURN_INBOUND"].split(os.pathsep)
         if os.environ.get("CORPUS_RETURN_INBOUND")
         else [
-            "/Volumes/tests/sp-mac-v1/sp-context/inbound",
-            "/Volumes/tests/sp-mac-v1/blackboard/attachments/work-mac-authored-solutions",
+            # Defaults derive from SP_NAS_DIR (same env nas-sync.sh honors — G4
+            # one-source-of-truth precedent), so a mount relocation (design C)
+            # is ONE env var on each machine, not a per-tool edit hunt.
+            os.environ.get("SP_NAS_DIR", "/Volumes/tests/sp-mac-v1") + "/sp-context/inbound",
+            os.environ.get("SP_NAS_DIR", "/Volumes/tests/sp-mac-v1")
+            + "/blackboard/attachments/work-mac-authored-solutions",
         ]
     )
 ]
